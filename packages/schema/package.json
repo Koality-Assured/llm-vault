@@ -1,0 +1,28 @@
+{
+  "name": "@llm-vault/schema",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./db/postgres": {
+      "types": "./dist/db/postgres.d.ts",
+      "default": "./dist/db/postgres.js"
+    },
+    "./db/sqlite": {
+      "types": "./dist/db/sqlite.d.ts",
+      "default": "./dist/db/sqlite.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@llm-vault/crypto": "0.1.0",
+    "@llm-vault/ids": "0.1.0",
+    "drizzle-orm": "^0.45.4",
+    "zod": "^3.25.76"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "name": "@llm-vault/crypto",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@llm-vault/ids": "0.1.0",
+    "hash-wasm": "^4.12.0"
+  }
+}
