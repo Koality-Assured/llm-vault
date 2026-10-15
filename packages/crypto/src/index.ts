@@ -41,6 +41,10 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
 }
 
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64url");
+}
+
 export function base64ToBytes(base64: string): Uint8Array {
   const buf = Buffer.from(base64, "base64");
   const out = new Uint8Array(buf.byteLength);
@@ -1709,4 +1713,181 @@ export async function restoreEncryptedBackup<T = unknown>(params: {
   } finally {
     zeroizeBuffer(derivedBytes);
   }
+}
+
+export interface ParsedJwt {
+  header: Record<string, unknown>;
+  payload: Record<string, unknown>;
+  signature: Uint8Array;
+  signedData: Uint8Array;
+}
+
+export function parseJwt(token: string): ParsedJwt {
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error(
+      "Invalid JWT format: token must have exactly three parts (header.payload.signature).",
+    );
+  }
+
+  const [headerB64, payloadB64, sigB64] = parts;
+  if (!headerB64 || !payloadB64 || sigB64 === undefined) {
+    throw new Error("Invalid JWT: empty token segment.");
+  }
+
+  try {
+    const headerJson = textDecoder.decode(base64ToBytes(headerB64));
+    const payloadJson = textDecoder.decode(base64ToBytes(payloadB64));
+    const header = JSON.parse(headerJson) as Record<string, unknown>;
+    const payload = JSON.parse(payloadJson) as Record<string, unknown>;
+    const signature = base64ToBytes(sigB64);
+    const signedData = textEncoder.encode(`${headerB64}.${payloadB64}`);
+
+    return {
+      header,
+      payload,
+      signature,
+      signedData,
+    };
+  } catch (err) {
+    throw new Error(
+      `Failed to decode JWT segments: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+export function matchClaimPattern(
+  actualValue: unknown,
+  expectedPattern: string | string[],
+): boolean {
+  if (Array.isArray(expectedPattern)) {
+    return expectedPattern.some((pat) => matchClaimPattern(actualValue, pat));
+  }
+
+  if (Array.isArray(actualValue)) {
+    return actualValue.some((val) => matchClaimPattern(val, expectedPattern));
+  }
+
+  const actualStr = String(actualValue ?? "");
+
+  // Wildcard "*" matches anything
+  if (expectedPattern === "*") {
+    return true;
+  }
+
+  // Single wildcard pattern (e.g. "refs/heads/*", "repo:my-org/*")
+  if (expectedPattern.includes("*")) {
+    const starIdx = expectedPattern.indexOf("*");
+    const prefix = expectedPattern.slice(0, starIdx);
+    const suffix = expectedPattern.slice(starIdx + 1);
+
+    if (suffix === "") {
+      return actualStr.startsWith(prefix);
+    }
+    if (prefix === "") {
+      return actualStr.endsWith(suffix);
+    }
+    return (
+      actualStr.startsWith(prefix) &&
+      actualStr.endsWith(suffix) &&
+      actualStr.length >= prefix.length + suffix.length
+    );
+  }
+
+  return actualStr === expectedPattern;
+}
+
+export function evaluateClaimFilters(
+  claims: Record<string, unknown>,
+  filters: Record<string, string | string[]>,
+): boolean {
+  for (const [key, expectedPattern] of Object.entries(filters)) {
+    if (!(key in claims)) {
+      return false;
+    }
+    const claimVal = claims[key];
+    if (!matchClaimPattern(claimVal, expectedPattern)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function verifyJwtClaims(
+  token: string,
+  options: {
+    expectedIssuer: string;
+    expectedAudience: string;
+    clockToleranceSeconds?: number;
+  },
+): Record<string, unknown> {
+  const { payload } = parseJwt(token);
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const tolerance = options.clockToleranceSeconds ?? 60;
+
+  // Validate exp (Expiration Time)
+  if (typeof payload.exp === "number") {
+    if (nowSeconds > payload.exp + tolerance) {
+      throw new Error(
+        `JWT expired at ${new Date(payload.exp * 1000).toISOString()} (current time: ${new Date(nowSeconds * 1000).toISOString()}).`,
+      );
+    }
+  }
+
+  // Validate nbf (Not Before)
+  if (typeof payload.nbf === "number") {
+    if (nowSeconds < payload.nbf - tolerance) {
+      throw new Error(`JWT not valid before ${new Date(payload.nbf * 1000).toISOString()}.`);
+    }
+  }
+
+  // Validate iss (Issuer)
+  if (payload.iss !== options.expectedIssuer) {
+    throw new Error(
+      `JWT issuer mismatch: expected "${options.expectedIssuer}", got "${String(payload.iss)}".`,
+    );
+  }
+
+  // Validate aud (Audience)
+  const actualAud = payload.aud;
+  let audMatches = false;
+  if (typeof actualAud === "string") {
+    audMatches = actualAud === options.expectedAudience;
+  } else if (Array.isArray(actualAud)) {
+    audMatches = actualAud.includes(options.expectedAudience);
+  }
+  if (!audMatches) {
+    throw new Error(
+      `JWT audience mismatch: expected "${options.expectedAudience}", got ${JSON.stringify(actualAud)}.`,
+    );
+  }
+
+  return payload;
+}
+
+export async function createTestWorkloadJwt(
+  payload: Record<string, unknown>,
+  header: Record<string, unknown> = { alg: "HS256", typ: "JWT" },
+  secret = "test-workload-jwt-signing-secret",
+): Promise<string> {
+  const encHeader = bytesToBase64Url(textEncoder.encode(JSON.stringify(header)));
+  const encPayload = bytesToBase64Url(textEncoder.encode(JSON.stringify(payload)));
+  const unsigned = `${encHeader}.${encPayload}`;
+
+  const hmacKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    toBuffer(textEncoder.encode(secret)),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+
+  const sigBuffer = await globalThis.crypto.subtle.sign(
+    "HMAC",
+    hmacKey,
+    toBuffer(textEncoder.encode(unsigned)),
+  );
+  const encSig = bytesToBase64Url(new Uint8Array(sigBuffer));
+
+  return `${unsigned}.${encSig}`;
 }

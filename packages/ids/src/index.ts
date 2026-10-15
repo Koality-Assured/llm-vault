@@ -12,9 +12,27 @@ const TIME_LEN = 10;
 const RANDOM_LEN = 16;
 const ULID_LEN = 26;
 
-export const ENTITY_PREFIX_NAMES = ["sec", "vlt", "fld", "usr", "agt", "lease", "aud"] as const;
+export const ENTITY_PREFIX_NAMES = [
+  "sec",
+  "vlt",
+  "fld",
+  "usr",
+  "agt",
+  "lease",
+  "aud",
+  "wkb",
+] as const;
 
-export const ENTITY_PREFIXES = ["sec_", "vlt_", "fld_", "usr_", "agt_", "lease_", "aud_"] as const;
+export const ENTITY_PREFIXES = [
+  "sec_",
+  "vlt_",
+  "fld_",
+  "usr_",
+  "agt_",
+  "lease_",
+  "aud_",
+  "wkb_",
+] as const;
 
 export type EntityPrefixName = (typeof ENTITY_PREFIX_NAMES)[number];
 export type EntityPrefix = (typeof ENTITY_PREFIXES)[number];
@@ -28,6 +46,7 @@ export type UserId = EntityId<"usr">;
 export type AgentId = EntityId<"agt">;
 export type LeaseId = EntityId<"lease">;
 export type AuditId = EntityId<"aud">;
+export type WorkloadBindingId = EntityId<"wkb">;
 
 export type SecretHandle = `{{vault:sec_${string}}}`;
 
@@ -42,7 +61,7 @@ export interface ParsedEntityId {
 
 const PREFIX_NAME_SET = new Set<string>(ENTITY_PREFIX_NAMES);
 const ULID_REGEX = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/i;
-const ENTITY_ID_REGEX = /^(sec|vlt|fld|usr|agt|lease|aud)_([0-7][0-9a-hjkmnp-tv-z]{25})$/i;
+const ENTITY_ID_REGEX = /^(sec|vlt|fld|usr|agt|lease|aud|wkb)_([0-7][0-9a-hjkmnp-tv-z]{25})$/i;
 const SECRET_HANDLE_REGEX = /^\{\{vault:(sec_[0-7][0-9a-hjkmnp-tv-z]{25})\}\}$/i;
 
 export function normalizePrefix(prefix: EntityPrefixInput): {

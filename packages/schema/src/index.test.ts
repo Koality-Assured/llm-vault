@@ -226,6 +226,7 @@ describe("@llm-vault/schema", () => {
       "users",
       "vaultMemberKeys",
       "vaults",
+      "workloadBindings",
     ]);
     expect(sqliteKeys).toEqual(pgKeys);
 

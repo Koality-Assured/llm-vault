@@ -213,6 +213,22 @@ export function initSchema(sqlite: Database.Database): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS workload_bindings (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      vault_id TEXT NOT NULL REFERENCES vaults(id),
+      name TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      issuer TEXT NOT NULL,
+      audience TEXT NOT NULL,
+      claim_filters TEXT NOT NULL,
+      vault_role TEXT NOT NULL DEFAULT 'SecretReader',
+      token_ttl_seconds INTEGER NOT NULL DEFAULT 300,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_vaults_tenant ON vaults(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_vault_member_keys_vault ON vault_member_keys(vault_id);
@@ -226,6 +242,9 @@ export function initSchema(sqlite: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_recovery_requests_vault ON recovery_requests(vault_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_idp_configs_tenant ON idp_configs(tenant_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_siem_configs_tenant ON siem_configs(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_workload_bindings_tenant ON workload_bindings(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_workload_bindings_vault ON workload_bindings(vault_id);
+    CREATE INDEX IF NOT EXISTS idx_workload_bindings_provider_issuer ON workload_bindings(provider, issuer);
   `);
 }
 

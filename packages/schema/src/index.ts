@@ -550,3 +550,69 @@ export const CsvSecretImportSchema = z.object({
   rows: z.array(CsvSecretImportRowSchema).min(1),
 });
 export type CsvSecretImport = z.infer<typeof CsvSecretImportSchema>;
+
+export const WorkloadProviderSchema = z.enum([
+  "github-actions",
+  "aws-iam",
+  "gcp-workload",
+  "spiffe-jwt",
+]);
+export type WorkloadProvider = z.infer<typeof WorkloadProviderSchema>;
+
+export const WorkloadBindingSchema = z.object({
+  id: z.string().startsWith("wkb_"),
+  tenantId: z.string().min(1),
+  vaultId: VaultIdSchema,
+  name: z.string().min(1).max(128),
+  provider: WorkloadProviderSchema,
+  issuer: z.string().min(1),
+  audience: z.string().min(1),
+  claimFilters: z.record(z.string(), z.union([z.string(), z.array(z.string())])),
+  vaultRole: VaultRoleSchema,
+  tokenTtlSeconds: z.number().int().min(30).max(86400).default(300),
+  status: z.enum(["active", "disabled"]).default("active"),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type WorkloadBinding = z.infer<typeof WorkloadBindingSchema>;
+
+export const CreateWorkloadBindingRequestSchema = z.object({
+  name: z.string().min(1).max(128),
+  provider: WorkloadProviderSchema,
+  issuer: z.string().min(1),
+  audience: z.string().min(1),
+  claimFilters: z.record(z.string(), z.union([z.string(), z.array(z.string())])),
+  vaultRole: VaultRoleSchema.default("SecretReader"),
+  tokenTtlSeconds: z.number().int().min(30).max(86400).default(300),
+});
+export type CreateWorkloadBindingRequest = z.infer<typeof CreateWorkloadBindingRequestSchema>;
+
+export const WorkloadIdentityExchangeRequestSchema = z.object({
+  token: z.string().min(10, "Token is required"),
+  provider: WorkloadProviderSchema,
+  workloadBindingId: z.string().optional(),
+  clientPublicKey: z.string().optional(),
+});
+export type WorkloadIdentityExchangeRequest = z.infer<typeof WorkloadIdentityExchangeRequestSchema>;
+
+export const WorkloadIdentityExchangeResponseSchema = z.object({
+  token: z.string(),
+  tenantId: z.string(),
+  actorId: z.string(),
+  agentId: z.string(),
+  vaultId: VaultIdSchema,
+  vaultRole: VaultRoleSchema,
+  expiresAt: z.string(),
+  encryptedVaultKey: z
+    .object({
+      ciphertext: z.string(),
+      iv: z.string(),
+      authTag: z.string(),
+      aad: z.string(),
+      keyVersion: z.number().int().min(1),
+    })
+    .optional(),
+});
+export type WorkloadIdentityExchangeResponse = z.infer<
+  typeof WorkloadIdentityExchangeResponseSchema
+>;

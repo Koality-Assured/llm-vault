@@ -332,6 +332,34 @@ export const siemConfigs = sqliteTable(
   (table) => [uniqueIndex("siem_configs_tenant_unique").on(table.tenantId)],
 );
 
+export const workloadBindings = sqliteTable(
+  "workload_bindings",
+  {
+    id: text("id").primaryKey(),
+    tenantId: text("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    vaultId: text("vault_id")
+      .notNull()
+      .references(() => vaults.id),
+    name: text("name").notNull(),
+    provider: text("provider").notNull(),
+    issuer: text("issuer").notNull(),
+    audience: text("audience").notNull(),
+    claimFilters: text("claim_filters").notNull(),
+    vaultRole: text("vault_role").notNull().default("SecretReader"),
+    tokenTtlSeconds: integer("token_ttl_seconds").notNull().default(300),
+    status: text("status").notNull().default("active"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_workload_bindings_tenant").on(table.tenantId),
+    index("idx_workload_bindings_vault").on(table.vaultId),
+    index("idx_workload_bindings_provider_issuer").on(table.provider, table.issuer),
+  ],
+);
+
 export const sqliteSchema = {
   tenants,
   users,
@@ -346,4 +374,5 @@ export const sqliteSchema = {
   recoveryRequests,
   idpConfigs,
   siemConfigs,
+  workloadBindings,
 };
