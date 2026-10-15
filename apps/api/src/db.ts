@@ -170,6 +170,49 @@ export function initSchema(sqlite: Database.Database): void {
       timestamp TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS recovery_requests (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id),
+      vault_id TEXT NOT NULL REFERENCES vaults(id),
+      initiator_user_id TEXT NOT NULL REFERENCES users(id),
+      initiator_system_role TEXT NOT NULL,
+      initiator_share TEXT NOT NULL,
+      approver_user_id TEXT REFERENCES users(id),
+      approver_system_role TEXT,
+      approver_share TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      reason TEXT NOT NULL,
+      recovered_key_hex TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS idp_configs (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) UNIQUE,
+      provider_type TEXT NOT NULL,
+      issuer TEXT NOT NULL,
+      client_id TEXT,
+      client_secret TEXT,
+      authorization_endpoint TEXT,
+      token_endpoint TEXT,
+      sso_url TEXT,
+      certificate TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS siem_configs (
+      id TEXT PRIMARY KEY,
+      tenant_id TEXT NOT NULL REFERENCES tenants(id) UNIQUE,
+      webhook_url TEXT NOT NULL,
+      shared_secret TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_vaults_tenant ON vaults(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_vault_member_keys_vault ON vault_member_keys(vault_id);
@@ -179,6 +222,10 @@ export function initSchema(sqlite: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_secret_versions_secret ON secret_versions(secret_id);
     CREATE INDEX IF NOT EXISTS idx_secret_tag_indexes_vault_tag ON secret_tag_indexes(vault_id, tag_blind_index);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_tenant_time ON audit_logs(tenant_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_recovery_requests_tenant ON recovery_requests(tenant_id);
+    CREATE INDEX IF NOT EXISTS idx_recovery_requests_vault ON recovery_requests(vault_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_idp_configs_tenant ON idp_configs(tenant_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_siem_configs_tenant ON siem_configs(tenant_id);
   `);
 }
 

@@ -264,6 +264,74 @@ export const auditLogs = sqliteTable(
   ],
 );
 
+export const recoveryRequests = sqliteTable(
+  "recovery_requests",
+  {
+    id: text("id").primaryKey(),
+    tenantId: text("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    vaultId: text("vault_id")
+      .notNull()
+      .references(() => vaults.id),
+    initiatorUserId: text("initiator_user_id")
+      .notNull()
+      .references(() => users.id),
+    initiatorSystemRole: text("initiator_system_role").notNull(),
+    initiatorShare: text("initiator_share").notNull(),
+    approverUserId: text("approver_user_id").references(() => users.id),
+    approverSystemRole: text("approver_system_role"),
+    approverShare: text("approver_share"),
+    status: text("status").notNull().default("pending"),
+    reason: text("reason").notNull(),
+    recoveredKeyHex: text("recovered_key_hex"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("idx_recovery_requests_tenant").on(table.tenantId),
+    index("idx_recovery_requests_vault").on(table.vaultId),
+  ],
+);
+
+export const idpConfigs = sqliteTable(
+  "idp_configs",
+  {
+    id: text("id").primaryKey(),
+    tenantId: text("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    providerType: text("provider_type").notNull(),
+    issuer: text("issuer").notNull(),
+    clientId: text("client_id"),
+    clientSecret: text("client_secret"),
+    authorizationEndpoint: text("authorization_endpoint"),
+    tokenEndpoint: text("token_endpoint"),
+    ssoUrl: text("sso_url"),
+    certificate: text("certificate"),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("idp_configs_tenant_unique").on(table.tenantId)],
+);
+
+export const siemConfigs = sqliteTable(
+  "siem_configs",
+  {
+    id: text("id").primaryKey(),
+    tenantId: text("tenant_id")
+      .notNull()
+      .references(() => tenants.id),
+    webhookUrl: text("webhook_url").notNull(),
+    sharedSecret: text("shared_secret").notNull(),
+    enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [uniqueIndex("siem_configs_tenant_unique").on(table.tenantId)],
+);
+
 export const sqliteSchema = {
   tenants,
   users,
@@ -275,4 +343,7 @@ export const sqliteSchema = {
   secretVersions,
   secretTagIndexes,
   auditLogs,
+  recoveryRequests,
+  idpConfigs,
+  siemConfigs,
 };

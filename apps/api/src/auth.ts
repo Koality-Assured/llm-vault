@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { eq } from "drizzle-orm";
 import type { VaultDatabase } from "./db.js";
-import { agents, tenants } from "@llm-vault/schema/db/sqlite";
+import { agents, tenants, users } from "@llm-vault/schema/db/sqlite";
 
 export interface AuthenticatedCaller {
   actorId: string; // usr_<ulid> or agt_<ulid>
@@ -53,6 +53,20 @@ export async function authenticateRequest(
     if (Date.now() > session.expiresAt) {
       activeSessions.delete(token);
       return null;
+    }
+    const userRecords = database.db
+      .select()
+      .from(users)
+      .where(eq(users.id, session.caller.actorId))
+      .all();
+    const user = userRecords[0];
+    if (user) {
+      if (user.status !== "active") {
+        activeSessions.delete(token);
+        return null;
+      }
+      session.caller.systemRole = user.systemRole;
+      session.caller.displayName = user.displayName;
     }
     return session.caller;
   }
