@@ -433,3 +433,120 @@ export const VerifyAuditLogsResponseSchema = z.object({
   reason: z.string().optional(),
 });
 export type VerifyAuditLogsResponse = z.infer<typeof VerifyAuditLogsResponseSchema>;
+
+export const MAX_UNCOMPRESSED_IMPORT_BYTES = 52_428_800; // 50MB per spec [M-4]
+export const MAX_COMPRESSION_RATIO = 20;
+
+export const EncryptedBackupContainerSchema = z.object({
+  format: z.literal("llm-vault-backup"),
+  version: z.literal(1),
+  kdf: z.object({
+    provider: z.enum(["pbkdf2", "argon2id"]),
+    salt: z.string(),
+    iterations: z.number().int().min(100_000),
+  }),
+  iv: z.string(),
+  ciphertext: z.string(),
+  authTag: z.string(),
+  tenantId: z.string(),
+  vaultId: z.string(),
+  exportedAt: z.string(),
+  itemCount: z.number().int().nonnegative(),
+});
+export type EncryptedBackupContainer = z.infer<typeof EncryptedBackupContainerSchema>;
+
+export const BitwardenExportItemSchema = z.object({
+  id: z.string().optional(),
+  organizationId: z.string().nullable().optional(),
+  folderId: z.string().nullable().optional(),
+  type: z.number().int().optional(),
+  name: z.string(),
+  notes: z.string().nullable().optional(),
+  favorite: z.boolean().optional(),
+  login: z
+    .object({
+      username: z.string().nullable().optional(),
+      password: z.string().nullable().optional(),
+      uris: z
+        .array(
+          z.object({
+            match: z.number().nullable().optional(),
+            uri: z.string().nullable().optional(),
+          }),
+        )
+        .optional(),
+      totp: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
+  fields: z
+    .array(
+      z.object({
+        name: z.string().nullable().optional(),
+        value: z.string().nullable().optional(),
+        type: z.number().optional(),
+      }),
+    )
+    .optional(),
+});
+export type BitwardenExportItem = z.infer<typeof BitwardenExportItemSchema>;
+
+export const BitwardenExportSchema = z.object({
+  encrypted: z.boolean().optional().default(false),
+  folders: z
+    .array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+      }),
+    )
+    .optional()
+    .default([]),
+  items: z.array(BitwardenExportItemSchema),
+});
+export type BitwardenExport = z.infer<typeof BitwardenExportSchema>;
+
+export const OnePasswordPuxItemSchema = z.object({
+  uuid: z.string().optional(),
+  title: z.string(),
+  category: z.string().optional(),
+  notes: z.string().optional(),
+  details: z
+    .object({
+      fields: z
+        .array(
+          z.object({
+            id: z.string().optional(),
+            name: z.string().optional(),
+            value: z.string().optional(),
+            type: z.string().optional(),
+          }),
+        )
+        .optional(),
+      password: z.string().optional(),
+    })
+    .optional(),
+});
+export type OnePasswordPuxItem = z.infer<typeof OnePasswordPuxItemSchema>;
+
+export const OnePasswordPuxSchema = z.object({
+  accounts: z.array(z.any()).optional(),
+  items: z.array(OnePasswordPuxItemSchema),
+});
+export type OnePasswordPux = z.infer<typeof OnePasswordPuxSchema>;
+
+export const CsvSecretImportRowSchema = z.object({
+  name: z.string().min(1),
+  value: z.string().min(1),
+  description: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  folderName: z.string().optional(),
+  username: z.string().optional(),
+  notes: z.string().optional(),
+});
+export type CsvSecretImportRow = z.infer<typeof CsvSecretImportRowSchema>;
+
+export const CsvSecretImportSchema = z.object({
+  rows: z.array(CsvSecretImportRowSchema).min(1),
+});
+export type CsvSecretImport = z.infer<typeof CsvSecretImportSchema>;

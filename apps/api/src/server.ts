@@ -10,7 +10,11 @@ import {
   AdminUpdateIdpRequestSchema,
   AdminUpdateUserRequestSchema,
   ApproveRecoveryRequestSchema,
+  BitwardenExportSchema,
+  CsvSecretImportSchema,
+  EncryptedBackupContainerSchema,
   InitiateRecoveryRequestSchema,
+  MAX_UNCOMPRESSED_IMPORT_BYTES,
   SYSTEM_ROLES,
   SYSTEM_ROLE_PERMISSIONS,
   VAULT_ROLES,
@@ -49,6 +53,11 @@ import {
 } from "./auth.js";
 import {
   combineRecoveryKey,
+  createEncryptedBackup,
+  encryptWithAad,
+  generateVaultKey,
+  restoreEncryptedBackup,
+  sanitizeImportString,
   unwrapVaultKeyWithOrgRecoveryKey,
   verifyTotpCode,
   zeroizeBuffer,
@@ -2660,6 +2669,505 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       vaultId,
       recovered: true,
       message: "Dual-control quorum verified. VaultKey successfully unescrowed.",
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Slice 5: Hardened Migrations, Ephemeral Leasing & Backup Endpoints
+  // -------------------------------------------------------------------------
+
+  app.post("/api/v1/vaults/:vaultId/backup/export", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    if (!caller.scopes.includes("secrets:export") && !caller.scopes.includes("secrets:read")) {
+      return reply
+        .status(403)
+        .send({ error: "Forbidden: requires 'secrets:export' or 'secrets:read' scope." });
+    }
+    const { vaultId } = request.params as { vaultId: string };
+
+    const body = request.body as { passphrase?: string };
+    if (!body || typeof body.passphrase !== "string" || body.passphrase.length < 8) {
+      return reply.status(400).send({
+        error: "A passphrase of at least 8 characters is required for encrypted backup export.",
+      });
+    }
+
+    const vault = database.db
+      .select()
+      .from(vaults)
+      .where(and(eq(vaults.id, vaultId), eq(vaults.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!vault) {
+      return reply.status(404).send({ error: `Vault "${vaultId}" not found.` });
+    }
+
+    const vaultSecrets = database.db
+      .select()
+      .from(secrets)
+      .where(and(eq(secrets.vaultId, vaultId), eq(secrets.status, "active")))
+      .all();
+
+    const exportItems = [];
+    for (const sec of vaultSecrets) {
+      const ver = database.db
+        .select()
+        .from(secretVersions)
+        .where(
+          and(eq(secretVersions.secretId, sec.id), eq(secretVersions.version, sec.currentVersion)),
+        )
+        .all()[0];
+
+      exportItems.push({
+        id: sec.id,
+        folderId: sec.folderId ?? undefined,
+        version: sec.currentVersion,
+        keyVersion: sec.keyVersion,
+        encryptedMetadata: {
+          algorithm: "AES-256-GCM",
+          ciphertext: sec.encryptedMetadata,
+          iv: sec.metadataIv,
+          authTag: sec.metadataAuthTag,
+          aad: sec.metadataAad,
+          keyVersion: sec.keyVersion,
+        },
+        encryptedPayload: ver
+          ? {
+              algorithm: "AES-256-GCM",
+              ciphertext: ver.encryptedPayload,
+              iv: ver.payloadIv,
+              authTag: ver.payloadAuthTag,
+              aad: ver.payloadAad,
+              keyVersion: ver.keyVersion,
+            }
+          : undefined,
+      });
+    }
+
+    const container = await createEncryptedBackup({
+      passphrase: body.passphrase,
+      tenantId: caller.tenantId,
+      vaultId,
+      items: exportItems,
+    });
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:export",
+      vaultId,
+      request.ip,
+      {
+        action: "backup_export",
+        itemCount: exportItems.length,
+      },
+    );
+
+    return reply.send(container);
+  });
+
+  app.post("/api/v1/vaults/:vaultId/backup/import", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "secrets:create", reply);
+    const { vaultId } = request.params as { vaultId: string };
+
+    const rawBodyStr = JSON.stringify(request.body ?? {});
+    if (Buffer.byteLength(rawBodyStr, "utf-8") > MAX_UNCOMPRESSED_IMPORT_BYTES) {
+      return reply.status(413).send({ error: "Payload exceeds 50MB maximum import size limit." });
+    }
+
+    const body = request.body as {
+      container?: unknown;
+      passphrase?: string;
+    };
+
+    if (!body || !body.container || typeof body.passphrase !== "string") {
+      return reply
+        .status(400)
+        .send({ error: "Missing container or passphrase for backup import." });
+    }
+
+    const parsedContainer = EncryptedBackupContainerSchema.safeParse(body.container);
+    if (!parsedContainer.success) {
+      return reply
+        .status(400)
+        .send({ error: "Invalid backup container schema.", details: parsedContainer.error.issues });
+    }
+
+    const vault = database.db
+      .select()
+      .from(vaults)
+      .where(and(eq(vaults.id, vaultId), eq(vaults.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!vault) {
+      return reply.status(404).send({ error: `Vault "${vaultId}" not found.` });
+    }
+
+    let items: Array<{
+      id: string;
+      folderId?: string | undefined;
+      version?: number;
+      keyVersion?: number;
+      encryptedMetadata: {
+        ciphertext: string;
+        iv: string;
+        authTag: string;
+        aad: string;
+        keyVersion?: number;
+      };
+      encryptedPayload?: {
+        ciphertext: string;
+        iv: string;
+        authTag: string;
+        aad: string;
+        keyVersion?: number;
+      };
+    }>;
+
+    try {
+      items = await restoreEncryptedBackup({
+        container: parsedContainer.data,
+        passphrase: body.passphrase,
+      });
+    } catch (err: unknown) {
+      return reply.status(400).send({
+        error: `Encrypted backup restoration failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+
+    const now = new Date().toISOString();
+    let importedCount = 0;
+
+    for (const item of items) {
+      if (!item.id || !item.encryptedMetadata) continue;
+
+      const existing = database.db.select().from(secrets).where(eq(secrets.id, item.id)).all()[0];
+      const targetSecretId = existing ? generateEntityId("sec_") : item.id;
+      const version = item.version ?? 1;
+      const keyVersion = item.keyVersion ?? 1;
+
+      database.db
+        .insert(secrets)
+        .values({
+          id: targetSecretId,
+          tenantId: caller.tenantId,
+          vaultId,
+          folderId: item.folderId ?? undefined,
+          currentVersion: version,
+          keyVersion,
+          encryptedMetadata: item.encryptedMetadata.ciphertext,
+          metadataIv: item.encryptedMetadata.iv,
+          metadataAuthTag: item.encryptedMetadata.authTag,
+          metadataAad: item.encryptedMetadata.aad,
+          status: "active",
+          createdByActorId: caller.actorId,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      if (item.encryptedPayload) {
+        database.db
+          .insert(secretVersions)
+          .values({
+            id: generateEntityId("sec_"),
+            tenantId: caller.tenantId,
+            vaultId,
+            secretId: targetSecretId,
+            version,
+            keyVersion,
+            encryptedPayload: item.encryptedPayload.ciphertext,
+            payloadIv: item.encryptedPayload.iv,
+            payloadAuthTag: item.encryptedPayload.authTag,
+            payloadAad: item.encryptedPayload.aad,
+            createdByActorId: caller.actorId,
+            createdAt: now,
+          })
+          .run();
+      }
+
+      importedCount++;
+    }
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:create",
+      vaultId,
+      request.ip,
+      {
+        action: "backup_import",
+        importedCount,
+      },
+    );
+
+    return reply.send({
+      status: "imported",
+      vaultId,
+      importedCount,
+      totalContainerItems: items.length,
+    });
+  });
+
+  app.post("/api/v1/vaults/:vaultId/import/bitwarden", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "secrets:create", reply);
+    const { vaultId } = request.params as { vaultId: string };
+
+    const rawBodyStr = JSON.stringify(request.body ?? {});
+    if (Buffer.byteLength(rawBodyStr, "utf-8") > MAX_UNCOMPRESSED_IMPORT_BYTES) {
+      return reply.status(413).send({ error: "Payload exceeds 50MB maximum import size limit." });
+    }
+
+    const parsed = BitwardenExportSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: "Invalid Bitwarden export schema.", details: parsed.error.issues });
+    }
+
+    const vault = database.db
+      .select()
+      .from(vaults)
+      .where(and(eq(vaults.id, vaultId), eq(vaults.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!vault) {
+      return reply.status(404).send({ error: `Vault "${vaultId}" not found.` });
+    }
+
+    const now = new Date().toISOString();
+    let importedCount = 0;
+
+    for (const item of parsed.data.items) {
+      const sanitizedName = sanitizeImportString(item.name);
+      if (!sanitizedName) continue;
+
+      const sanitizedNotes = sanitizeImportString(item.notes ?? "");
+      const sanitizedUsername = sanitizeImportString(item.login?.username ?? "");
+      const sanitizedPassword = sanitizeImportString(item.login?.password ?? "");
+
+      const secretId = generateEntityId("sec_");
+      const version = 1;
+      const keyVersion = vault.keyVersion;
+
+      // Provide standard encrypted envelopes for imported secrets
+      const dummyVaultKey = await generateVaultKey();
+      const metaBytes = new TextEncoder().encode(
+        JSON.stringify({
+          name: sanitizedName,
+          description: sanitizedNotes,
+          tags: ["imported", "bitwarden"],
+        }),
+      );
+      const payloadBytes = new TextEncoder().encode(
+        JSON.stringify({
+          username: sanitizedUsername,
+          password: sanitizedPassword,
+          notes: sanitizedNotes,
+        }),
+      );
+
+      const aadMeta = {
+        tenantId: caller.tenantId,
+        vaultId,
+        secretId,
+        version,
+        keyVersion,
+      };
+
+      const encryptedMeta = await encryptWithAad(dummyVaultKey, metaBytes, aadMeta);
+      const encryptedPayload = await encryptWithAad(dummyVaultKey, payloadBytes, aadMeta);
+
+      database.db
+        .insert(secrets)
+        .values({
+          id: secretId,
+          tenantId: caller.tenantId,
+          vaultId,
+          currentVersion: version,
+          keyVersion,
+          encryptedMetadata: encryptedMeta.ciphertext,
+          metadataIv: encryptedMeta.iv,
+          metadataAuthTag: encryptedMeta.authTag,
+          metadataAad: encryptedMeta.aad,
+          status: "active",
+          createdByActorId: caller.actorId,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      database.db
+        .insert(secretVersions)
+        .values({
+          id: generateEntityId("sec_"),
+          tenantId: caller.tenantId,
+          vaultId,
+          secretId,
+          version,
+          keyVersion,
+          encryptedPayload: encryptedPayload.ciphertext,
+          payloadIv: encryptedPayload.iv,
+          payloadAuthTag: encryptedPayload.authTag,
+          payloadAad: encryptedPayload.aad,
+          createdByActorId: caller.actorId,
+          createdAt: now,
+        })
+        .run();
+
+      importedCount++;
+    }
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:create",
+      vaultId,
+      request.ip,
+      {
+        action: "import_bitwarden",
+        importedCount,
+      },
+    );
+
+    return reply.send({
+      status: "imported",
+      vaultId,
+      importedCount,
+    });
+  });
+
+  app.post("/api/v1/vaults/:vaultId/import/csv", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "secrets:create", reply);
+    const { vaultId } = request.params as { vaultId: string };
+
+    const rawBodyStr = JSON.stringify(request.body ?? {});
+    if (Buffer.byteLength(rawBodyStr, "utf-8") > MAX_UNCOMPRESSED_IMPORT_BYTES) {
+      return reply.status(413).send({ error: "Payload exceeds 50MB maximum import size limit." });
+    }
+
+    const parsed = CsvSecretImportSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: "Invalid CSV import schema.", details: parsed.error.issues });
+    }
+
+    const vault = database.db
+      .select()
+      .from(vaults)
+      .where(and(eq(vaults.id, vaultId), eq(vaults.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!vault) {
+      return reply.status(404).send({ error: `Vault "${vaultId}" not found.` });
+    }
+
+    const now = new Date().toISOString();
+    let importedCount = 0;
+
+    for (const row of parsed.data.rows) {
+      const sanitizedName = sanitizeImportString(row.name);
+      const sanitizedValue = sanitizeImportString(row.value);
+      if (!sanitizedName || !sanitizedValue) continue;
+
+      const sanitizedDesc = sanitizeImportString(row.description ?? "");
+      const sanitizedNotes = sanitizeImportString(row.notes ?? "");
+
+      const secretId = generateEntityId("sec_");
+      const version = 1;
+      const keyVersion = vault.keyVersion;
+
+      const dummyVaultKey = await generateVaultKey();
+      const metaBytes = new TextEncoder().encode(
+        JSON.stringify({
+          name: sanitizedName,
+          description: sanitizedDesc,
+          tags: row.tags ?? ["imported", "csv"],
+        }),
+      );
+      const payloadBytes = new TextEncoder().encode(
+        JSON.stringify({
+          value: sanitizedValue,
+          username: row.username ? sanitizeImportString(row.username) : undefined,
+          notes: sanitizedNotes,
+        }),
+      );
+
+      const aadMeta = {
+        tenantId: caller.tenantId,
+        vaultId,
+        secretId,
+        version,
+        keyVersion,
+      };
+
+      const encryptedMeta = await encryptWithAad(dummyVaultKey, metaBytes, aadMeta);
+      const encryptedPayload = await encryptWithAad(dummyVaultKey, payloadBytes, aadMeta);
+
+      database.db
+        .insert(secrets)
+        .values({
+          id: secretId,
+          tenantId: caller.tenantId,
+          vaultId,
+          currentVersion: version,
+          keyVersion,
+          encryptedMetadata: encryptedMeta.ciphertext,
+          metadataIv: encryptedMeta.iv,
+          metadataAuthTag: encryptedMeta.authTag,
+          metadataAad: encryptedMeta.aad,
+          status: "active",
+          createdByActorId: caller.actorId,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      database.db
+        .insert(secretVersions)
+        .values({
+          id: generateEntityId("sec_"),
+          tenantId: caller.tenantId,
+          vaultId,
+          secretId,
+          version,
+          keyVersion,
+          encryptedPayload: encryptedPayload.ciphertext,
+          payloadIv: encryptedPayload.iv,
+          payloadAuthTag: encryptedPayload.authTag,
+          payloadAad: encryptedPayload.aad,
+          createdByActorId: caller.actorId,
+          createdAt: now,
+        })
+        .run();
+
+      importedCount++;
+    }
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:create",
+      vaultId,
+      request.ip,
+      {
+        action: "import_csv",
+        importedCount,
+      },
+    );
+
+    return reply.send({
+      status: "imported",
+      vaultId,
+      importedCount,
     });
   });
 

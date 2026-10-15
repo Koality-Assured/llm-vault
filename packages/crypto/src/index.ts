@@ -1499,3 +1499,169 @@ export async function verifyTotpCode(
 
   return false;
 }
+
+export function sanitizeImportString(input: string): string {
+  if (typeof input !== "string") {
+    return "";
+  }
+  // Strip control characters (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F, 0x7F) while preserving \t, \n, \r
+  let cleaned = "";
+  for (let i = 0; i < input.length; i++) {
+    const code = input.charCodeAt(i);
+    if (
+      (code >= 0x00 && code <= 0x08) ||
+      code === 0x0b ||
+      code === 0x0c ||
+      (code >= 0x0e && code <= 0x1f) ||
+      code === 0x7f
+    ) {
+      continue;
+    }
+    cleaned += input[i];
+  }
+  // Strip HTML / script tags
+  cleaned = cleaned.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
+  cleaned = cleaned.replace(/<[^>]+>/g, "");
+  return cleaned.trim();
+}
+
+export interface EncryptedBackupContainerData {
+  format: "llm-vault-backup";
+  version: 1;
+  kdf: {
+    provider: "pbkdf2" | "argon2id";
+    salt: string;
+    iterations: number;
+  };
+  iv: string;
+  ciphertext: string;
+  authTag: string;
+  tenantId: string;
+  vaultId: string;
+  exportedAt: string;
+  itemCount: number;
+}
+
+export async function createEncryptedBackup(params: {
+  passphrase: string;
+  tenantId: string;
+  vaultId: string;
+  items: unknown[];
+  iterations?: number;
+  exportedAt?: string;
+}): Promise<EncryptedBackupContainerData> {
+  const iterations = params.iterations ?? MIN_PBKDF2_ITERATIONS;
+  if (iterations < 100_000) {
+    throw new RangeError("Backup PBKDF2 iterations must be at least 100,000");
+  }
+
+  const salt = new Uint8Array(MASTER_SALT_BYTES);
+  globalThis.crypto.getRandomValues(salt);
+
+  const derivedBytes = await deriveMasterKeyMaterial(params.passphrase, salt, iterations);
+  const cryptoKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    toBuffer(derivedBytes),
+    { name: "AES-GCM" },
+    false,
+    ["encrypt"],
+  );
+
+  const iv = new Uint8Array(AES_GCM_IV_BYTES);
+  globalThis.crypto.getRandomValues(iv);
+
+  const aad = textEncoder.encode(`llm-vault:backup:v1:${params.tenantId}:${params.vaultId}`);
+  const plaintextBytes = textEncoder.encode(JSON.stringify(params.items));
+
+  const encryptedBuffer = await globalThis.crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: toBuffer(iv),
+      additionalData: toBuffer(aad),
+      tagLength: AES_GCM_TAG_BITS,
+    },
+    cryptoKey,
+    toBuffer(plaintextBytes),
+  );
+
+  const fullBytes = new Uint8Array(encryptedBuffer);
+  const ciphertextLength = fullBytes.length - AES_GCM_TAG_BYTES;
+  const ciphertextBytes = fullBytes.subarray(0, ciphertextLength);
+  const authTagBytes = fullBytes.subarray(ciphertextLength);
+
+  zeroizeBuffer(derivedBytes);
+  zeroizeBuffer(plaintextBytes);
+
+  return {
+    format: "llm-vault-backup",
+    version: 1,
+    kdf: {
+      provider: "pbkdf2",
+      salt: bytesToBase64(salt),
+      iterations,
+    },
+    iv: bytesToBase64(iv),
+    ciphertext: bytesToBase64(ciphertextBytes),
+    authTag: bytesToBase64(authTagBytes),
+    tenantId: params.tenantId,
+    vaultId: params.vaultId,
+    exportedAt: params.exportedAt ?? new Date().toISOString(),
+    itemCount: params.items.length,
+  };
+}
+
+export async function restoreEncryptedBackup<T = unknown>(params: {
+  container: EncryptedBackupContainerData;
+  passphrase: string;
+}): Promise<T[]> {
+  const { container, passphrase } = params;
+  if (container.format !== "llm-vault-backup" || container.version !== 1) {
+    throw new Error(`Unsupported backup format: ${container.format} v${container.version}`);
+  }
+  if (container.kdf.iterations < 100_000) {
+    throw new Error("Rejected backup container: KDF iterations below security minimum (100,000)");
+  }
+
+  const salt = base64ToBytes(container.kdf.salt);
+  const derivedBytes = await deriveMasterKeyMaterial(passphrase, salt, container.kdf.iterations);
+  const cryptoKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    toBuffer(derivedBytes),
+    { name: "AES-GCM" },
+    false,
+    ["decrypt"],
+  );
+
+  const iv = base64ToBytes(container.iv);
+  const ciphertextBytes = base64ToBytes(container.ciphertext);
+  const authTagBytes = base64ToBytes(container.authTag);
+  const combinedBuffer = new Uint8Array(ciphertextBytes.length + authTagBytes.length);
+  combinedBuffer.set(ciphertextBytes, 0);
+  combinedBuffer.set(authTagBytes, ciphertextBytes.length);
+
+  const aad = textEncoder.encode(`llm-vault:backup:v1:${container.tenantId}:${container.vaultId}`);
+
+  try {
+    const decryptedBuffer = await globalThis.crypto.subtle.decrypt(
+      {
+        name: "AES-GCM",
+        iv: toBuffer(iv),
+        additionalData: toBuffer(aad),
+        tagLength: AES_GCM_TAG_BITS,
+      },
+      cryptoKey,
+      toBuffer(combinedBuffer),
+    );
+
+    const decryptedBytes = new Uint8Array(decryptedBuffer);
+    const parsed = JSON.parse(textDecoder.decode(decryptedBytes)) as T[];
+    zeroizeBuffer(decryptedBytes);
+    return parsed;
+  } catch (err) {
+    throw new Error(
+      `Failed to restore encrypted backup (decryption or MAC verification failed): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  } finally {
+    zeroizeBuffer(derivedBytes);
+  }
+}
