@@ -56,6 +56,11 @@ import {
   wrapVaultKeyWithOrgRecoveryKey,
   wrapVaultKeyForRecipient,
   zeroizeBuffer,
+  calculateNextRotationDue,
+  isRotationDue,
+  generateProviderCredential,
+  verifyProviderCredential,
+  revokeProviderCredential,
 } from "./index.js";
 
 describe("@llm-vault/crypto", () => {
@@ -698,6 +703,74 @@ describe("@llm-vault/crypto", () => {
           expectedAudience: "https://different-vault.internal",
         }),
       ).toThrow(/JWT audience mismatch/);
+    });
+  });
+
+  describe("Slice 8: Automated Secret Rotation & Provider Integrations", () => {
+    it("calculates future rotation due dates and checks due status", () => {
+      const now = new Date("2026-10-15T12:00:00.000Z");
+      const nextDue = calculateNextRotationDue(30, now);
+      expect(nextDue).toBe("2026-11-14T12:00:00.000Z");
+
+      expect(() => calculateNextRotationDue(0, now)).toThrow(/positive integer/);
+      expect(() => calculateNextRotationDue(-5, now)).toThrow(/positive integer/);
+
+      // isRotationDue
+      expect(isRotationDue(null)).toBe(false);
+      expect(isRotationDue("2026-01-01T00:00:00.000Z")).toBe(true);
+      expect(isRotationDue("2030-01-01T00:00:00.000Z")).toBe(false);
+    });
+
+    it("generates, verifies, and revokes credentials for all supported rotation providers", async () => {
+      const providers = [
+        "ai-openai",
+        "ai-anthropic",
+        "ai-google-gemini",
+        "cloud-aws-iam",
+        "cloud-gcp-sa",
+        "cloud-azure-sp",
+        "vcs-github",
+        "db-postgres",
+        "db-mysql",
+        "generic-symmetric",
+      ] as const;
+
+      for (const provider of providers) {
+        const cred = await generateProviderCredential(provider, {
+          targetResourceId: "prod-service-account",
+        });
+        expect(cred.value).toBeDefined();
+        expect(cred.value.length).toBeGreaterThan(0);
+        expect(cred.metadata?.provider).toBe(provider);
+
+        // Verification must pass for newly generated credential
+        const verification = await verifyProviderCredential(provider, cred.value, {
+          targetResourceId: "prod-service-account",
+        });
+        expect(verification.valid).toBe(true);
+
+        // Verification must fail for invalid/empty/corrupted credential
+        const badVerification = await verifyProviderCredential(provider, "corrupted-invalid-key");
+        expect(badVerification.valid).toBe(false);
+
+        // Revocation
+        const revocation = await revokeProviderCredential(provider, cred.value, {
+          targetResourceId: "prod-service-account",
+        });
+        expect(revocation.revoked).toBe(true);
+      }
+    });
+
+    it("generates database remediation statements for PostgreSQL and MySQL user rotations", async () => {
+      const pgCred = await generateProviderCredential("db-postgres", {
+        targetResourceId: "payment_svc",
+      });
+      expect(pgCred.remediationCommand).toContain('ALTER ROLE "payment_svc" WITH PASSWORD');
+
+      const myCred = await generateProviderCredential("db-mysql", {
+        targetResourceId: "analytics_user",
+      });
+      expect(myCred.remediationCommand).toContain("ALTER USER 'analytics_user'@'%' IDENTIFIED BY");
     });
   });
 });

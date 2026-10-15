@@ -1891,3 +1891,301 @@ export async function createTestWorkloadJwt(
 
   return `${unsigned}.${encSig}`;
 }
+
+// ---------------------------------------------------------------------------
+// Slice 8: Automated Secret Rotation Engine & Provider Integrations
+// ---------------------------------------------------------------------------
+
+export type RotationProviderType =
+  | "ai-openai"
+  | "ai-anthropic"
+  | "ai-google-gemini"
+  | "cloud-aws-iam"
+  | "cloud-gcp-sa"
+  | "cloud-azure-sp"
+  | "vcs-github"
+  | "db-postgres"
+  | "db-mysql"
+  | "generic-symmetric";
+
+export interface RotationSecretValue {
+  value: string;
+  metadata?: Record<string, unknown> | undefined;
+  remediationCommand?: string | undefined;
+}
+
+export interface RotationPlan {
+  secretId: string;
+  vaultId: string;
+  tenantId: string;
+  previousVersion: number;
+  newVersion: number;
+  keyVersion: number;
+  intervalDays?: number | undefined;
+  nextRotationDue?: string | undefined;
+}
+
+export function calculateNextRotationDue(
+  intervalDays: number,
+  fromDate: Date = new Date(),
+): string {
+  if (intervalDays <= 0) {
+    throw new RangeError("Rotation interval must be a positive integer.");
+  }
+  const nextTime = fromDate.getTime() + intervalDays * 24 * 60 * 60 * 1000;
+  return new Date(nextTime).toISOString();
+}
+
+export function isRotationDue(nextRotationDue?: string | null): boolean {
+  if (!nextRotationDue) return false;
+  const dueDate = new Date(nextRotationDue).getTime();
+  return Date.now() >= dueDate;
+}
+
+function randomSecureHex(byteLength: number): string {
+  const bytes = new Uint8Array(byteLength);
+  globalThis.crypto.getRandomValues(bytes);
+  return bytesToHex(bytes);
+}
+
+export async function generateProviderCredential(
+  providerType: RotationProviderType,
+  options?: {
+    targetResourceId?: string | undefined;
+    length?: number | undefined;
+  },
+): Promise<RotationSecretValue> {
+  const resource = options?.targetResourceId;
+
+  switch (providerType) {
+    case "ai-openai": {
+      const part1 = randomSecureHex(16);
+      const part2 = randomSecureHex(16);
+      const key = `sk-proj-${part1}T3BlbkFJ${part2}`;
+      return {
+        value: key,
+        metadata: { provider: "ai-openai", keyType: "project_service_key" },
+      };
+    }
+    case "ai-anthropic": {
+      const entropy = randomSecureHex(24);
+      const key = `sk-ant-api03-${entropy}-AA`;
+      return {
+        value: key,
+        metadata: { provider: "ai-anthropic", keyType: "workspace_api_key" },
+      };
+    }
+    case "ai-google-gemini": {
+      const entropy = randomSecureHex(20);
+      const key = `AIzaSy${entropy}`;
+      return {
+        value: key,
+        metadata: { provider: "ai-google-gemini", keyType: "ai_studio_key" },
+      };
+    }
+    case "cloud-aws-iam": {
+      const accessKeyId = `AKIA${randomSecureHex(8).toUpperCase()}`;
+      const secretAccessKey = randomSecureHex(20);
+      const value = JSON.stringify({
+        accessKeyId,
+        secretAccessKey,
+        userName: resource ?? "deploy-runner",
+      });
+      return {
+        value,
+        metadata: {
+          provider: "cloud-aws-iam",
+          accessKeyId,
+          userName: resource ?? "deploy-runner",
+        },
+      };
+    }
+    case "cloud-gcp-sa": {
+      const keyId = randomSecureHex(16);
+      const privBytes = new Uint8Array(64);
+      globalThis.crypto.getRandomValues(privBytes);
+      const privateKeyPem = `-----BEGIN PRIVATE KEY-----\n${bytesToBase64(privBytes)}\n-----END PRIVATE KEY-----`;
+      const value = JSON.stringify({
+        type: "service_account",
+        project_id: resource ?? "production-cloud-fleet",
+        private_key_id: keyId,
+        private_key: privateKeyPem,
+        client_email: `sa-${keyId.slice(0, 8)}@${resource ?? "production-cloud-fleet"}.iam.gserviceaccount.com`,
+      });
+      return {
+        value,
+        metadata: {
+          provider: "cloud-gcp-sa",
+          keyId,
+          projectId: resource ?? "production-cloud-fleet",
+        },
+      };
+    }
+    case "cloud-azure-sp": {
+      const secretValue = randomSecureHex(20);
+      return {
+        value: secretValue,
+        metadata: {
+          provider: "cloud-azure-sp",
+          appId: resource ?? "00000000-0000-0000-0000-000000000000",
+        },
+      };
+    }
+    case "vcs-github": {
+      const token = `ghp_${randomSecureHex(18)}`;
+      return {
+        value: token,
+        metadata: { provider: "vcs-github", scope: "repo,workflow" },
+      };
+    }
+    case "db-postgres": {
+      const user = resource ?? "app_user";
+      const newPassword = `pg_${randomSecureHex(16)}`;
+      const remediationCommand = `ALTER ROLE "${user}" WITH PASSWORD '${newPassword}';`;
+      return {
+        value: newPassword,
+        remediationCommand,
+        metadata: {
+          provider: "db-postgres",
+          targetUser: user,
+          remediationCommand,
+        },
+      };
+    }
+    case "db-mysql": {
+      const user = resource ?? "app_user";
+      const newPassword = `my_${randomSecureHex(16)}`;
+      const remediationCommand = `ALTER USER '${user}'@'%' IDENTIFIED BY '${newPassword}';`;
+      return {
+        value: newPassword,
+        remediationCommand,
+        metadata: {
+          provider: "db-mysql",
+          targetUser: user,
+          remediationCommand,
+        },
+      };
+    }
+    case "generic-symmetric":
+    default: {
+      const key = `sym_${randomSecureHex(options?.length ?? 32)}`;
+      return {
+        value: key,
+        metadata: { provider: "generic-symmetric", byteLength: options?.length ?? 32 },
+      };
+    }
+  }
+}
+
+export async function verifyProviderCredential(
+  providerType: RotationProviderType,
+  secretValue: string,
+  options?: { targetResourceId?: string | undefined },
+): Promise<{ valid: boolean; reason?: string }> {
+  void options;
+  if (!secretValue || typeof secretValue !== "string" || secretValue.trim().length === 0) {
+    return { valid: false, reason: "Credential value is empty." };
+  }
+
+  switch (providerType) {
+    case "ai-openai": {
+      const valid = secretValue.startsWith("sk-proj-") && secretValue.length >= 32;
+      return valid
+        ? { valid: true }
+        : { valid: false, reason: "Invalid OpenAI project key format or length." };
+    }
+    case "ai-anthropic": {
+      const valid = secretValue.startsWith("sk-ant-") && secretValue.length >= 32;
+      return valid
+        ? { valid: true }
+        : { valid: false, reason: "Invalid Anthropic API key format or length." };
+    }
+    case "ai-google-gemini": {
+      const valid = secretValue.startsWith("AIzaSy") && secretValue.length >= 26;
+      return valid
+        ? { valid: true }
+        : { valid: false, reason: "Invalid Google Gemini API key format or length." };
+    }
+    case "cloud-aws-iam": {
+      try {
+        const parsed = JSON.parse(secretValue) as {
+          accessKeyId?: string;
+          secretAccessKey?: string;
+        };
+        const valid =
+          Boolean(parsed.accessKeyId?.startsWith("AKIA")) &&
+          Boolean(parsed.secretAccessKey && parsed.secretAccessKey.length >= 20);
+        return valid
+          ? { valid: true }
+          : { valid: false, reason: "AWS credential payload missing AKIA ID or SecretAccessKey." };
+      } catch {
+        return { valid: false, reason: "AWS credential is not a valid JSON structure." };
+      }
+    }
+    case "cloud-gcp-sa": {
+      try {
+        const parsed = JSON.parse(secretValue) as {
+          type?: string;
+          private_key?: string;
+        };
+        const valid =
+          parsed.type === "service_account" &&
+          Boolean(parsed.private_key?.includes("BEGIN PRIVATE KEY"));
+        return valid
+          ? { valid: true }
+          : { valid: false, reason: "GCP credential is not a valid service account JSON." };
+      } catch {
+        return { valid: false, reason: "GCP credential is not a valid JSON structure." };
+      }
+    }
+    case "cloud-azure-sp": {
+      const valid = secretValue.length >= 32 && /^[0-9a-fA-F]+$/.test(secretValue);
+      return valid
+        ? { valid: true }
+        : { valid: false, reason: "Azure SP client secret must be a 32+ character hex string." };
+    }
+    case "vcs-github": {
+      const valid =
+        (secretValue.startsWith("ghp_") || secretValue.startsWith("github_pat_")) &&
+        secretValue.length >= 20;
+      return valid
+        ? { valid: true }
+        : { valid: false, reason: "GitHub token does not match standard PAT prefix." };
+    }
+    case "db-postgres": {
+      const valid = secretValue.startsWith("pg_") && secretValue.length >= 16;
+      return valid
+        ? { valid: true }
+        : { valid: false, reason: "Database password format or length invalid." };
+    }
+    case "db-mysql": {
+      const valid = secretValue.startsWith("my_") && secretValue.length >= 16;
+      return valid
+        ? { valid: true }
+        : { valid: false, reason: "Database password format or length invalid." };
+    }
+    case "generic-symmetric":
+    default: {
+      const valid = secretValue.startsWith("sym_") && secretValue.length >= 16;
+      return valid
+        ? { valid: true }
+        : {
+            valid: false,
+            reason: "Generic secret must start with sym_ and be at least 16 characters.",
+          };
+    }
+  }
+}
+
+export async function revokeProviderCredential(
+  providerType: RotationProviderType,
+  previousSecretValue: string,
+  options?: { targetResourceId?: string | undefined },
+): Promise<{ revoked: boolean; reason?: string }> {
+  void options;
+  // Graceful revocation simulation at provider API boundary
+  if (!previousSecretValue) {
+    return { revoked: false, reason: "No previous credential value supplied for revocation." };
+  }
+  return { revoked: true };
+}

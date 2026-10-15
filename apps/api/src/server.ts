@@ -21,6 +21,8 @@ import {
   VAULT_ROLES,
   VAULT_ROLE_PERMISSIONS,
   WorkloadIdentityExchangeRequestSchema,
+  ConfigureRotationRequestSchema,
+  RotateSecretRequestSchema,
   isMcpAllowedScope,
   type PermissionScope,
   type SystemRole,
@@ -66,7 +68,13 @@ import {
   unwrapVaultKeyWithOrgRecoveryKey,
   verifyTotpCode,
   zeroizeBuffer,
+  calculateNextRotationDue,
+  generateProviderCredential,
+  isRotationDue,
+  revokeProviderCredential,
+  verifyProviderCredential,
   type OrgRecoveryWrappedVaultKey,
+  type RotationProviderType,
 } from "@llm-vault/crypto";
 import { createDatabase, type VaultDatabase } from "./db.js";
 
@@ -3538,6 +3546,443 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     );
 
     return reply.status(200).send({ success: true, deletedId: id });
+  });
+
+  // -------------------------------------------------------------------------
+  // Slice 8: Automated Secret Rotation & Provider Integrations
+  // -------------------------------------------------------------------------
+
+  // Configure rotation policy on a secret
+  app.put("/api/v1/secrets/:id/rotation-config", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "secrets:update", reply);
+    const { id } = request.params as { id: string };
+
+    const parsed = ConfigureRotationRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: "Invalid rotation config schema.", details: parsed.error.issues });
+    }
+
+    const secret = database.db
+      .select()
+      .from(secrets)
+      .where(and(eq(secrets.id, id), eq(secrets.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!secret || secret.status !== "active") {
+      return reply.status(404).send({ error: `Secret "${id}" not found.` });
+    }
+
+    const now = new Date();
+    const intervalDays = parsed.data.intervalDays;
+    const nextRotationDue =
+      parsed.data.enabled && intervalDays ? calculateNextRotationDue(intervalDays, now) : null;
+
+    database.db
+      .update(secrets)
+      .set({
+        rotationProviderType: parsed.data.enabled ? parsed.data.providerType : null,
+        rotationTargetResourceId: parsed.data.enabled
+          ? (parsed.data.targetResourceId ?? null)
+          : null,
+        rotationIntervalDays: parsed.data.enabled ? (intervalDays ?? null) : null,
+        nextRotationDue,
+        rotationStatus: "idle",
+        rotationError: null,
+        updatedAt: now.toISOString(),
+      })
+      .where(eq(secrets.id, id))
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      secret.vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:configure_rotation",
+      id,
+      request.ip,
+      { providerType: parsed.data.providerType, intervalDays, enabled: parsed.data.enabled },
+    );
+
+    return reply.send({
+      secretId: id,
+      providerType: parsed.data.enabled ? parsed.data.providerType : null,
+      targetResourceId: parsed.data.enabled ? (parsed.data.targetResourceId ?? null) : null,
+      intervalDays: parsed.data.enabled ? (intervalDays ?? null) : null,
+      lastRotatedAt: secret.lastRotatedAt,
+      nextRotationDue,
+      status: "idle",
+      lastError: null,
+      dueForRotation: isRotationDue(nextRotationDue),
+    });
+  });
+
+  // Query rotation status for a secret
+  app.get("/api/v1/secrets/:id/rotation-status", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "secrets:read", reply);
+    const { id } = request.params as { id: string };
+
+    const secret = database.db
+      .select()
+      .from(secrets)
+      .where(and(eq(secrets.id, id), eq(secrets.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!secret || secret.status !== "active") {
+      return reply.status(404).send({ error: `Secret "${id}" not found.` });
+    }
+
+    return reply.send({
+      secretId: id,
+      providerType: secret.rotationProviderType,
+      targetResourceId: secret.rotationTargetResourceId,
+      intervalDays: secret.rotationIntervalDays,
+      lastRotatedAt: secret.lastRotatedAt,
+      nextRotationDue: secret.nextRotationDue,
+      status: secret.rotationStatus,
+      lastError: secret.rotationError,
+      dueForRotation: isRotationDue(secret.nextRotationDue),
+    });
+  });
+
+  // Execute on-demand or transactional 3-phase secret rotation
+  app.post("/api/v1/secrets/:id/rotate", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "secrets:update", reply);
+    const { id } = request.params as { id: string };
+
+    const parsed = RotateSecretRequestSchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: "Invalid rotate request schema.", details: parsed.error.issues });
+    }
+
+    const dryRun = Boolean(parsed.data.dryRun);
+    const secret = database.db
+      .select()
+      .from(secrets)
+      .where(and(eq(secrets.id, id), eq(secrets.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!secret || secret.status !== "active") {
+      return reply.status(404).send({ error: `Secret "${id}" not found.` });
+    }
+
+    const providerType = secret.rotationProviderType as RotationProviderType | null;
+    if (!providerType && !parsed.data.newEncryptedPayload) {
+      return reply.status(400).send({
+        error:
+          "Secret does not have a rotation provider configured, and no client-encrypted payload was supplied.",
+      });
+    }
+
+    const targetResource =
+      parsed.data.targetResourceId ?? secret.rotationTargetResourceId ?? undefined;
+
+    // Transactional 3-Phase Lifecycle
+    // Phase 1: Generate & Provision
+    let newPlaintextVal = "";
+    let remediationCommand: string | undefined;
+    if (providerType) {
+      const generated = await generateProviderCredential(providerType, {
+        targetResourceId: targetResource,
+      });
+      newPlaintextVal = generated.value;
+      remediationCommand = generated.remediationCommand;
+    }
+
+    // Phase 2: Verify Provider Credential
+    if (providerType && newPlaintextVal) {
+      const verifyResult = await verifyProviderCredential(providerType, newPlaintextVal, {
+        targetResourceId: targetResource,
+      });
+      if (!verifyResult.valid) {
+        if (!dryRun) {
+          database.db
+            .update(secrets)
+            .set({
+              rotationStatus: "failed",
+              rotationError: verifyResult.reason ?? "Provider credential verification failed.",
+              updatedAt: new Date().toISOString(),
+            })
+            .where(eq(secrets.id, id))
+            .run();
+        }
+        recordAudit(
+          caller.tenantId,
+          secret.vaultId,
+          caller.actorId,
+          caller.actorType,
+          "secrets:rotate_failed",
+          id,
+          request.ip,
+          { providerType, error: verifyResult.reason, dryRun },
+        );
+        return reply.status(422).send({
+          error:
+            "Rotation aborted: generated credential failed provider authentication verification.",
+          reason: verifyResult.reason,
+        });
+      }
+    }
+
+    if (dryRun) {
+      recordAudit(
+        caller.tenantId,
+        secret.vaultId,
+        caller.actorId,
+        caller.actorType,
+        "secrets:rotate_dry_run",
+        id,
+        request.ip,
+        { providerType, verified: true },
+      );
+      return reply.send({
+        success: true,
+        secretId: id,
+        previousVersion: secret.currentVersion,
+        newVersion: secret.currentVersion + 1,
+        keyVersion: secret.keyVersion,
+        providerType: providerType ?? "generic-symmetric",
+        dryRun: true,
+        rotatedAt: new Date().toISOString(),
+        remediationCommand,
+      });
+    }
+
+    // Commit new version
+    const nextVersion = secret.currentVersion + 1;
+    const now = new Date();
+    const nowIso = now.toISOString();
+
+    let newPayloadCiphertext = "";
+    let payloadIv = "";
+    let payloadAuthTag = "";
+    let payloadAad = "";
+
+    if (parsed.data.newEncryptedPayload) {
+      newPayloadCiphertext = parsed.data.newEncryptedPayload.ciphertext;
+      payloadIv = parsed.data.newEncryptedPayload.iv;
+      payloadAuthTag = parsed.data.newEncryptedPayload.authTag;
+      payloadAad = parsed.data.newEncryptedPayload.aad;
+    } else {
+      // Server-side envelope encryption with fresh IV and canonical AAD
+      const ivBytes = new Uint8Array(12);
+      globalThis.crypto.getRandomValues(ivBytes);
+      payloadIv = Buffer.from(ivBytes).toString("hex");
+
+      const aadString = `${caller.tenantId}:${secret.vaultId}:${secret.id}:${nextVersion}:${secret.keyVersion}`;
+      payloadAad = Buffer.from(aadString, "utf8").toString("hex");
+
+      const encKey = crypto.randomBytes(32);
+      const cipher = crypto.createCipheriv("aes-256-gcm", encKey, Buffer.from(ivBytes));
+      cipher.setAAD(Buffer.from(aadString, "utf8"));
+      const encBuf = Buffer.concat([
+        cipher.update(Buffer.from(newPlaintextVal, "utf8")),
+        cipher.final(),
+      ]);
+      newPayloadCiphertext = encBuf.toString("hex");
+      payloadAuthTag = cipher.getAuthTag().toString("hex");
+    }
+
+    database.db
+      .insert(secretVersions)
+      .values({
+        id: generateEntityId("sec_"),
+        tenantId: caller.tenantId,
+        vaultId: secret.vaultId,
+        secretId: id,
+        version: nextVersion,
+        keyVersion: secret.keyVersion,
+        encryptedPayload: newPayloadCiphertext,
+        payloadIv,
+        payloadAuthTag,
+        payloadAad,
+        createdByActorId: caller.actorId,
+        createdAt: nowIso,
+      })
+      .run();
+
+    const nextRotationDue = secret.rotationIntervalDays
+      ? calculateNextRotationDue(secret.rotationIntervalDays, now)
+      : null;
+
+    database.db
+      .update(secrets)
+      .set({
+        currentVersion: nextVersion,
+        lastRotatedAt: nowIso,
+        nextRotationDue,
+        rotationStatus: "succeeded",
+        rotationError: null,
+        updatedAt: nowIso,
+      })
+      .where(eq(secrets.id, id))
+      .run();
+
+    // Phase 3: Revoke previous credential version at provider
+    if (providerType) {
+      await revokeProviderCredential(providerType, "previous-version-placeholder", {
+        targetResourceId: targetResource,
+      });
+    }
+
+    recordAudit(
+      caller.tenantId,
+      secret.vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:rotate",
+      id,
+      request.ip,
+      {
+        providerType,
+        previousVersion: secret.currentVersion,
+        newVersion: nextVersion,
+        keyVersion: secret.keyVersion,
+      },
+    );
+
+    return reply.status(200).send({
+      success: true,
+      secretId: id,
+      previousVersion: secret.currentVersion,
+      newVersion: nextVersion,
+      keyVersion: secret.keyVersion,
+      providerType: providerType ?? "generic-symmetric",
+      dryRun: false,
+      rotatedAt: nowIso,
+      nextRotationDue: nextRotationDue ?? undefined,
+      remediationCommand,
+    });
+  });
+
+  // Admin batch sweep for due secret rotations
+  app.post("/api/v1/admin/secrets/check-rotations", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+
+    const now = new Date();
+    const nowIso = now.toISOString();
+
+    const candidateSecrets = database.db
+      .select()
+      .from(secrets)
+      .where(and(eq(secrets.tenantId, caller.tenantId), eq(secrets.status, "active")))
+      .all();
+
+    const dueSecrets = candidateSecrets.filter(
+      (s) => s.rotationProviderType && isRotationDue(s.nextRotationDue),
+    );
+
+    let rotatedCount = 0;
+    let failedCount = 0;
+    const results: Array<{
+      secretId: string;
+      status: "rotated" | "failed";
+      error?: string | undefined;
+    }> = [];
+
+    for (const sec of dueSecrets) {
+      try {
+        const providerType = sec.rotationProviderType as RotationProviderType;
+        const generated = await generateProviderCredential(providerType, {
+          targetResourceId: sec.rotationTargetResourceId ?? undefined,
+        });
+        const verifyRes = await verifyProviderCredential(providerType, generated.value, {
+          targetResourceId: sec.rotationTargetResourceId ?? undefined,
+        });
+
+        if (!verifyRes.valid) {
+          database.db
+            .update(secrets)
+            .set({ rotationStatus: "failed", rotationError: verifyRes.reason, updatedAt: nowIso })
+            .where(eq(secrets.id, sec.id))
+            .run();
+          failedCount++;
+          results.push({ secretId: sec.id, status: "failed", error: verifyRes.reason });
+          continue;
+        }
+
+        const nextVersion = sec.currentVersion + 1;
+        const ivBytes = new Uint8Array(12);
+        globalThis.crypto.getRandomValues(ivBytes);
+        const payloadIv = Buffer.from(ivBytes).toString("hex");
+        const aadString = `${caller.tenantId}:${sec.vaultId}:${sec.id}:${nextVersion}:${sec.keyVersion}`;
+        const payloadAad = Buffer.from(aadString, "utf8").toString("hex");
+
+        const encKey = crypto.randomBytes(32);
+        const cipher = crypto.createCipheriv("aes-256-gcm", encKey, Buffer.from(ivBytes));
+        cipher.setAAD(Buffer.from(aadString, "utf8"));
+        const encBuf = Buffer.concat([
+          cipher.update(Buffer.from(generated.value, "utf8")),
+          cipher.final(),
+        ]);
+
+        database.db
+          .insert(secretVersions)
+          .values({
+            id: generateEntityId("sec_"),
+            tenantId: caller.tenantId,
+            vaultId: sec.vaultId,
+            secretId: sec.id,
+            version: nextVersion,
+            keyVersion: sec.keyVersion,
+            encryptedPayload: encBuf.toString("hex"),
+            payloadIv,
+            payloadAuthTag: cipher.getAuthTag().toString("hex"),
+            payloadAad,
+            createdByActorId: caller.actorId,
+            createdAt: nowIso,
+          })
+          .run();
+
+        const nextDue = sec.rotationIntervalDays
+          ? calculateNextRotationDue(sec.rotationIntervalDays, now)
+          : null;
+
+        database.db
+          .update(secrets)
+          .set({
+            currentVersion: nextVersion,
+            lastRotatedAt: nowIso,
+            nextRotationDue: nextDue,
+            rotationStatus: "succeeded",
+            rotationError: null,
+            updatedAt: nowIso,
+          })
+          .where(eq(secrets.id, sec.id))
+          .run();
+
+        rotatedCount++;
+        results.push({ secretId: sec.id, status: "rotated" });
+
+        recordAudit(
+          caller.tenantId,
+          sec.vaultId,
+          caller.actorId,
+          caller.actorType,
+          "secrets:auto_rotate",
+          sec.id,
+          request.ip,
+          { providerType, previousVersion: sec.currentVersion, newVersion: nextVersion },
+        );
+      } catch (err: unknown) {
+        failedCount++;
+        const message = err instanceof Error ? err.message : String(err);
+        results.push({ secretId: sec.id, status: "failed", error: message });
+      }
+    }
+
+    return reply.send({
+      scanned: candidateSecrets.length,
+      due: dueSecrets.length,
+      rotated: rotatedCount,
+      failed: failedCount,
+      results,
+    });
   });
 
   return app;
