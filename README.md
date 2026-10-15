@@ -1,7 +1,28 @@
-# llm-vault
+<div align="center">
+
+![LLM Vault Banner](assets/llm-vault-banner.svg)
+
+# LLM Vault
+
+<p align="center">
+  <img src="assets/llm-vault-logo.svg" alt="LLM Vault Logo" width="128" height="128" />
+</p>
+
+**Zero-Knowledge Secrets Management Platform for Autonomous AI Agents and Human Operators**
+
+[![CI](https://github.com/Koality-Assured/llm-vault/actions/workflows/ci.yml/badge.svg)](https://github.com/Koality-Assured/llm-vault/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Node.js 22+](https://img.shields.io/badge/node-22+-green.svg)](https://nodejs.org/)
+[![TypeScript 5.x](https://img.shields.io/badge/typescript-5.x-blue.svg)](https://www.typescriptlang.org/)
+[![Security: Zero--Knowledge](https://img.shields.io/badge/security-Zero--Knowledge-purple.svg)](#cryptographic-design)
+[![Domain: Llm-Vault](https://img.shields.io/badge/domain-llm-vault-blueviolet.svg)](<>)
+[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow.svg)](https://conventionalcommits.org)
+
+</div>
+
+---
 
 Zero-knowledge secrets management platform for autonomous AI coding agents and human operators.
-
 `llm-vault` pairs client-side W3C WebCrypto envelope encryption with deterministic, type-prefixed ULID identifiers (`sec_<ulid>`) and opaque handles (`{{vault:sec_<ulid>}}`, `lease_<ulid>`). Agents discover, inject, and rotate credentials through [`llm-vault-mcp`](https://github.com/Koality-Assured/llm-vault-mcp) without exposing plaintext secret values to LLM context windows, chat transcripts, or model provider telemetry.
 
 ## Architecture
