@@ -616,3 +616,67 @@ export const WorkloadIdentityExchangeResponseSchema = z.object({
 export type WorkloadIdentityExchangeResponse = z.infer<
   typeof WorkloadIdentityExchangeResponseSchema
 >;
+
+// ---------------------------------------------------------------------------
+// Slice 8: Automated Secret Rotation & Provider Integrations
+// ---------------------------------------------------------------------------
+
+export const SECRET_ROTATION_PROVIDER_TYPES = [
+  "ai-openai",
+  "ai-anthropic",
+  "ai-google-gemini",
+  "cloud-aws-iam",
+  "cloud-gcp-sa",
+  "cloud-azure-sp",
+  "vcs-github",
+  "db-postgres",
+  "db-mysql",
+  "generic-symmetric",
+] as const;
+
+export const SecretRotationProviderTypeSchema = z.enum(SECRET_ROTATION_PROVIDER_TYPES);
+export type SecretRotationProviderType = z.infer<typeof SecretRotationProviderTypeSchema>;
+
+export const RotationStatusSchema = z.enum(["idle", "in_progress", "failed", "succeeded"]);
+export type RotationStatus = z.infer<typeof RotationStatusSchema>;
+
+export const ConfigureRotationRequestSchema = z.object({
+  providerType: SecretRotationProviderTypeSchema,
+  targetResourceId: z.string().max(256).optional(),
+  intervalDays: z.number().int().min(1).max(365).optional(),
+  enabled: z.boolean().default(true),
+});
+export type ConfigureRotationRequest = z.infer<typeof ConfigureRotationRequestSchema>;
+
+export const RotateSecretRequestSchema = z.object({
+  dryRun: z.boolean().optional().default(false),
+  newEncryptedPayload: EncryptedEnvelopeSchema.optional(),
+  targetResourceId: z.string().max(256).optional(),
+});
+export type RotateSecretRequest = z.infer<typeof RotateSecretRequestSchema>;
+
+export const RotateSecretResponseSchema = z.object({
+  success: z.boolean(),
+  secretId: SecretIdSchema,
+  previousVersion: z.number().int().min(1),
+  newVersion: z.number().int().min(1),
+  keyVersion: z.number().int().min(1),
+  providerType: SecretRotationProviderTypeSchema,
+  dryRun: z.boolean(),
+  rotatedAt: z.string(),
+  nextRotationDue: z.string().optional(),
+});
+export type RotateSecretResponse = z.infer<typeof RotateSecretResponseSchema>;
+
+export const RotationStatusResponseSchema = z.object({
+  secretId: SecretIdSchema,
+  providerType: SecretRotationProviderTypeSchema.nullable().optional(),
+  targetResourceId: z.string().nullable().optional(),
+  intervalDays: z.number().int().nullable().optional(),
+  lastRotatedAt: z.string().nullable().optional(),
+  nextRotationDue: z.string().nullable().optional(),
+  status: RotationStatusSchema,
+  lastError: z.string().nullable().optional(),
+  dueForRotation: z.boolean(),
+});
+export type RotationStatusResponse = z.infer<typeof RotationStatusResponseSchema>;

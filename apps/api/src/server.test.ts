@@ -1833,4 +1833,403 @@ describe("Fastify REST API server (apps/api)", () => {
       expect(delRes.json().success).toBe(true);
     });
   });
+
+  describe("Slice 8: Automated Secret Rotation & Provider Integrations", () => {
+    let s8App: FastifyInstance;
+    let s8Db: VaultDatabase;
+    let s8Token = "";
+    let s8TenantId = "";
+    let s8VaultId = "";
+    let s8SecretId = "";
+
+    beforeAll(async () => {
+      const sqlite = new Database(":memory:");
+      initSchema(sqlite);
+      const db = drizzle(sqlite, { schema: sqliteSchema });
+      s8Db = { db, sqlite, path: ":memory:" };
+      s8App = buildServer({ database: s8Db, enableCors: false });
+      await s8App.ready();
+
+      s8TenantId = generateEntityId("vlt_");
+      const now = new Date().toISOString();
+
+      s8Db.db
+        .insert(sqliteSchema.tenants)
+        .values({
+          id: s8TenantId,
+          name: "Rotation Test Org",
+          slug: "rotation-test-org",
+          deploymentMode: "enterprise",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      const adminId = generateEntityId("usr_");
+      s8Db.db
+        .insert(sqliteSchema.users)
+        .values({
+          id: adminId,
+          tenantId: s8TenantId,
+          email: "rot-admin@vault.test",
+          displayName: "Rotation Admin",
+          systemRole: "SuperAdmin",
+          kdfSalt: "0123456789abcdef0123456789abcdef",
+          x25519PublicKey: "placeholder_x25519",
+          ed25519PublicKey: "placeholder_ed25519",
+          publicKeyFingerprint: "fingerprint_rot",
+          encryptedX25519PrivateKey: "priv_blob",
+          encryptedEd25519PrivateKey: "priv_blob",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      s8Token = issueSessionToken({
+        actorId: adminId,
+        actorType: "user",
+        tenantId: s8TenantId,
+        email: "rot-admin@vault.test",
+        displayName: "Rotation Admin",
+        systemRole: "SuperAdmin",
+        scopes: [
+          "secrets:read",
+          "secrets:create",
+          "secrets:update",
+          "secrets:reveal",
+          "vaults:create",
+          "vaults:share",
+          "vaults:admin",
+          "users:admin",
+        ],
+      });
+
+      // Create vault
+      const vRes = await s8App.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          name: "Production API Keys Vault",
+          description: "Vault containing cloud and AI secrets",
+          encryptedVaultKey: {
+            ciphertext: "enc_vault_key_ciphertext_blob_s8",
+            iv: "iv_0123456789abcdef",
+            authTag: "auth_tag_0123456789abcdef",
+            aad: "aad_vlt_s8",
+          },
+        },
+      });
+      expect(vRes.statusCode).toBe(201);
+      s8VaultId = vRes.json().id;
+
+      // Create an OpenAI secret
+      const sRes = await s8App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s8VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          id: generateEntityId("sec_"),
+          vaultId: s8VaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            ciphertext: "enc_meta_s8",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_meta_s8",
+          },
+          encryptedPayload: {
+            ciphertext: "enc_payload_v1_openai",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_payload_s8",
+          },
+          tagBlindIndexes: [],
+        },
+      });
+      expect(sRes.statusCode).toBe(201);
+      s8SecretId = sRes.json().id;
+    });
+
+    afterAll(async () => {
+      await s8App.close();
+    });
+
+    it("configures rotation policy on a secret and queries rotation status", async () => {
+      const putRes = await s8App.inject({
+        method: "PUT",
+        url: `/api/v1/secrets/${s8SecretId}/rotation-config`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          providerType: "ai-openai",
+          targetResourceId: "proj_openai_prod_123",
+          intervalDays: 14,
+          enabled: true,
+        },
+      });
+
+      expect(putRes.statusCode).toBe(200);
+      const data = putRes.json();
+      expect(data.secretId).toBe(s8SecretId);
+      expect(data.providerType).toBe("ai-openai");
+      expect(data.intervalDays).toBe(14);
+      expect(data.nextRotationDue).toBeDefined();
+      expect(data.status).toBe("idle");
+      expect(data.dueForRotation).toBe(false);
+
+      // Verify GET rotation-status
+      const getRes = await s8App.inject({
+        method: "GET",
+        url: `/api/v1/secrets/${s8SecretId}/rotation-status`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(getRes.statusCode).toBe(200);
+      expect(getRes.json().providerType).toBe("ai-openai");
+      expect(getRes.json().targetResourceId).toBe("proj_openai_prod_123");
+    });
+
+    it("executes a dry-run rotation verifying provider generation without mutating version", async () => {
+      const dryRunRes = await s8App.inject({
+        method: "POST",
+        url: `/api/v1/secrets/${s8SecretId}/rotate`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: { dryRun: true },
+      });
+
+      expect(dryRunRes.statusCode).toBe(200);
+      const data = dryRunRes.json();
+      expect(data.dryRun).toBe(true);
+      expect(data.previousVersion).toBe(1);
+      expect(data.newVersion).toBe(2);
+      expect(data.providerType).toBe("ai-openai");
+
+      // Verify secret was NOT mutated
+      const checkRes = await s8App.inject({
+        method: "GET",
+        url: `/api/v1/secrets/${s8SecretId}`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(checkRes.statusCode).toBe(200);
+      expect(checkRes.json().version).toBe(1);
+    });
+
+    it("executes live 3-phase rotation, commits version + 1, and updates nextRotationDue", async () => {
+      const rotateRes = await s8App.inject({
+        method: "POST",
+        url: `/api/v1/secrets/${s8SecretId}/rotate`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: { dryRun: false },
+      });
+
+      expect(rotateRes.statusCode).toBe(200);
+      const data = rotateRes.json();
+      expect(data.success).toBe(true);
+      expect(data.previousVersion).toBe(1);
+      expect(data.newVersion).toBe(2);
+      expect(data.rotatedAt).toBeDefined();
+      expect(data.nextRotationDue).toBeDefined();
+
+      // Verify database state: currentVersion is now 2
+      const checkRes = await s8App.inject({
+        method: "GET",
+        url: `/api/v1/secrets/${s8SecretId}`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(checkRes.statusCode).toBe(200);
+      expect(checkRes.json().version).toBe(2);
+
+      // Verify versions endpoint reflects both version 1 and 2
+      const verRes = await s8App.inject({
+        method: "GET",
+        url: `/api/v1/secrets/${s8SecretId}/versions`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(verRes.statusCode).toBe(200);
+      expect(verRes.json().versions.length).toBe(2);
+      expect(verRes.json().versions[0].version).toBe(2);
+    });
+
+    it("supports cloud infrastructure and database rotations (AWS IAM, PostgreSQL with remediation commands)", async () => {
+      // 1. Create AWS IAM secret
+      const awsSecId = generateEntityId("sec_");
+      const cRes = await s8App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s8VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          id: awsSecId,
+          vaultId: s8VaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            ciphertext: "enc_meta_aws",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_aws",
+          },
+          encryptedPayload: {
+            ciphertext: "enc_payload_aws",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_aws",
+          },
+          tagBlindIndexes: [],
+        },
+      });
+      expect(cRes.statusCode).toBe(201);
+
+      // Configure AWS IAM rotation
+      await s8App.inject({
+        method: "PUT",
+        url: `/api/v1/secrets/${awsSecId}/rotation-config`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          providerType: "cloud-aws-iam",
+          targetResourceId: "prod-ci-runner",
+          intervalDays: 90,
+          enabled: true,
+        },
+      });
+
+      // Rotate AWS IAM
+      const awsRot = await s8App.inject({
+        method: "POST",
+        url: `/api/v1/secrets/${awsSecId}/rotate`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(awsRot.statusCode).toBe(200);
+      expect(awsRot.json().newVersion).toBe(2);
+      expect(awsRot.json().providerType).toBe("cloud-aws-iam");
+
+      // 2. Create PostgreSQL database secret
+      const pgSecId = generateEntityId("sec_");
+      await s8App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s8VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          id: pgSecId,
+          vaultId: s8VaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            ciphertext: "enc_meta_pg",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_pg",
+          },
+          encryptedPayload: {
+            ciphertext: "enc_payload_pg",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_pg",
+          },
+          tagBlindIndexes: [],
+        },
+      });
+
+      // Configure PostgreSQL rotation
+      await s8App.inject({
+        method: "PUT",
+        url: `/api/v1/secrets/${pgSecId}/rotation-config`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          providerType: "db-postgres",
+          targetResourceId: "billing_app_svc",
+          intervalDays: 30,
+          enabled: true,
+        },
+      });
+
+      // Rotate PostgreSQL secret and verify SQL remediation command is returned
+      const pgRot = await s8App.inject({
+        method: "POST",
+        url: `/api/v1/secrets/${pgSecId}/rotate`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(pgRot.statusCode).toBe(200);
+      expect(pgRot.json().remediationCommand).toContain(
+        'ALTER ROLE "billing_app_svc" WITH PASSWORD',
+      );
+    });
+
+    it("sweeps and rotates scheduled secrets via POST /api/v1/admin/secrets/check-rotations", async () => {
+      // Create a secret and set nextRotationDue in the past (overdue for rotation)
+      const overdueSecId = generateEntityId("sec_");
+      await s8App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s8VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          id: overdueSecId,
+          vaultId: s8VaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            ciphertext: "enc_meta_overdue",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_overdue",
+          },
+          encryptedPayload: {
+            ciphertext: "enc_payload_overdue",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_overdue",
+          },
+          tagBlindIndexes: [],
+        },
+      });
+
+      // Set rotation config
+      await s8App.inject({
+        method: "PUT",
+        url: `/api/v1/secrets/${overdueSecId}/rotation-config`,
+        headers: { authorization: `Bearer ${s8Token}` },
+        payload: {
+          providerType: "generic-symmetric",
+          intervalDays: 7,
+          enabled: true,
+        },
+      });
+
+      // Force nextRotationDue to past timestamp directly in sqlite
+      const pastTime = new Date(Date.now() - 3600 * 1000).toISOString();
+      s8Db.sqlite
+        .prepare("UPDATE secrets SET next_rotation_due = ? WHERE id = ?")
+        .run(pastTime, overdueSecId);
+
+      // Verify status reports dueForRotation = true
+      const statRes = await s8App.inject({
+        method: "GET",
+        url: `/api/v1/secrets/${overdueSecId}/rotation-status`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(statRes.statusCode).toBe(200);
+      expect(statRes.json().dueForRotation).toBe(true);
+
+      // Execute batch sweep
+      const sweepRes = await s8App.inject({
+        method: "POST",
+        url: "/api/v1/admin/secrets/check-rotations",
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+
+      expect(sweepRes.statusCode).toBe(200);
+      const sweepData = sweepRes.json();
+      expect(sweepData.due).toBeGreaterThanOrEqual(1);
+      expect(sweepData.rotated).toBeGreaterThanOrEqual(1);
+      expect(sweepData.failed).toBe(0);
+
+      // Verify overdue secret has been updated to version 2
+      const updatedSec = await s8App.inject({
+        method: "GET",
+        url: `/api/v1/secrets/${overdueSecId}`,
+        headers: { authorization: `Bearer ${s8Token}` },
+      });
+      expect(updatedSec.statusCode).toBe(200);
+      expect(updatedSec.json().version).toBe(2);
+    });
+  });
 });

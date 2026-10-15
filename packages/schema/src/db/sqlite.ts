@@ -177,6 +177,13 @@ export const secrets = sqliteTable(
     metadataAuthTag: text("metadata_auth_tag").notNull(),
     metadataAad: text("metadata_aad").notNull(),
     status: text("status").notNull().default("active"),
+    rotationProviderType: text("rotation_provider_type"),
+    rotationTargetResourceId: text("rotation_target_resource_id"),
+    rotationIntervalDays: integer("rotation_interval_days"),
+    lastRotatedAt: text("last_rotated_at"),
+    nextRotationDue: text("next_rotation_due"),
+    rotationStatus: text("rotation_status").notNull().default("idle"),
+    rotationError: text("rotation_error"),
     createdByActorId: text("created_by_actor_id").notNull(),
     createdAt: text("created_at").notNull(),
     updatedAt: text("updated_at").notNull(),
@@ -185,6 +192,7 @@ export const secrets = sqliteTable(
     index("idx_secrets_tenant").on(table.tenantId),
     index("idx_secrets_vault").on(table.vaultId),
     index("idx_secrets_folder").on(table.folderId),
+    index("idx_secrets_rotation_due").on(table.nextRotationDue),
   ],
 );
 

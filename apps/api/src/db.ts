@@ -123,6 +123,13 @@ export function initSchema(sqlite: Database.Database): void {
       metadata_auth_tag TEXT NOT NULL,
       metadata_aad TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'active',
+      rotation_provider_type TEXT,
+      rotation_target_resource_id TEXT,
+      rotation_interval_days INTEGER,
+      last_rotated_at TEXT,
+      next_rotation_due TEXT,
+      rotation_status TEXT NOT NULL DEFAULT 'idle',
+      rotation_error TEXT,
       created_by_actor_id TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -245,6 +252,7 @@ export function initSchema(sqlite: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_workload_bindings_tenant ON workload_bindings(tenant_id);
     CREATE INDEX IF NOT EXISTS idx_workload_bindings_vault ON workload_bindings(vault_id);
     CREATE INDEX IF NOT EXISTS idx_workload_bindings_provider_issuer ON workload_bindings(provider, issuer);
+    CREATE INDEX IF NOT EXISTS idx_secrets_rotation_due ON secrets(next_rotation_due);
   `);
 }
 
