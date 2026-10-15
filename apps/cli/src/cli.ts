@@ -10,6 +10,9 @@ import {
 import { SecretResolver, type SecretPayloadData } from "./resolver.js";
 import { runCommand } from "./runner.js";
 import { injectTemplate } from "./injector.js";
+import { scanWorkspace } from "./scanner.js";
+import { absorbFile } from "./absorb.js";
+import { installPreCommitHook, removePreCommitHook, getPreCommitHookStatus } from "./hook.js";
 
 const HELP_TEXT = `
 llm-vault - Developer CLI for zero-knowledge secret management and zero-file process injection.
@@ -20,6 +23,9 @@ USAGE:
 COMMANDS:
   run             Execute a child process with in-memory decrypted environment variables
   inject          Render a template into an ephemeral in-memory FIFO and run a child command
+  scan            Scan workspace files or staged changes for unencrypted credentials
+  absorb          Migrate hardcoded secrets into vault records and rewrite files to templates
+  hook            Manage git pre-commit hooks (install, remove, status)
   login           Cache an authentication token and server endpoint in local session store
   logout          Clear active local session cache
   status, whoami  Display active session and connection status
@@ -36,6 +42,19 @@ INJECT OPTIONS:
   --template <path>   Path to configuration template file (e.g. app.config.tpl)
   --fifo-env <name>   Environment variable name to pass the FIFO path (default: VAULT_CONFIG_FIFO)
 
+SCAN OPTIONS:
+  --staged            Only scan files staged in git index
+  --fail-on-found     Exit with code 1 if unencrypted credentials are found
+  --json              Output findings as formatted JSON
+
+ABSORB OPTIONS:
+  --file <path>       Target file to scan and migrate (e.g. .env)
+  --dry-run           Preview tokenization and template output without modifying disk
+  --in-place          Rewrite target file in place instead of creating .tpl
+
+HOOK OPTIONS:
+  llm-vault hook [status|install|remove]
+
 LOGIN OPTIONS:
   --endpoint <url>    Vault API server URL (e.g. http://localhost:3000)
   --token <token>     Bearer authentication token or agent token (agt_...)
@@ -43,6 +62,9 @@ LOGIN OPTIONS:
   --actor <id>        User or agent ID (usr_... / agt_...)
 
 EXAMPLES:
+  llm-vault scan --staged --fail-on-found
+  llm-vault absorb .env --dry-run
+  llm-vault hook install
   llm-vault run --env-file .env.vault -- npm start
   llm-vault inject --template config.json.tpl -- node server.js --config {{FIFO_PATH}}
   llm-vault login --endpoint http://localhost:3000 --token tok_123 --tenant tnt_prod --actor usr_admin
@@ -274,6 +296,149 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       });
 
       return result.exitCode;
+    }
+
+    case "scan": {
+      const { values, positionals } = parseArgs({
+        args: cliOptionsArgs,
+        options: {
+          staged: { type: "boolean", default: false },
+          json: { type: "boolean", default: false },
+          "fail-on-found": { type: "boolean", default: false },
+          dir: { type: "string" },
+        },
+        allowPositionals: true,
+      });
+
+      const targetFiles = positionals.length > 0 ? positionals : undefined;
+      const targetDir = values.dir ?? process.cwd();
+
+      const scanResult = await scanWorkspace({
+        directory: targetDir,
+        files: targetFiles,
+        stagedOnly: values.staged,
+      });
+
+      if (values.json) {
+        console.log(JSON.stringify(scanResult, null, 2));
+      } else {
+        console.log(`Scanned ${scanResult.scannedFiles} file(s) in ${scanResult.durationMs}ms.`);
+        if (scanResult.findings.length === 0) {
+          console.log("No unencrypted credentials detected. Workspace is clean.");
+        } else {
+          console.log(`Found ${scanResult.findings.length} unencrypted credential(s):\n`);
+          for (const f of scanResult.findings) {
+            console.log(`  [${f.ruleId}] ${f.filePath}:${f.line}:${f.column}`);
+            console.log(`    Description: ${f.description}`);
+            console.log(`    Redacted:    ${f.redactedValue} (entropy: ${f.entropy})`);
+            if (f.suggestedHandle) {
+              console.log(`    Suggested:   ${f.suggestedHandle}`);
+            }
+            console.log("");
+          }
+          console.log(
+            "Run `llm-vault absorb <file>` to tokenize credentials into {{vault:sec_...}} templates.",
+          );
+        }
+      }
+
+      if (scanResult.findings.length > 0 && values["fail-on-found"]) {
+        return 1;
+      }
+      return 0;
+    }
+
+    case "absorb": {
+      const { values, positionals } = parseArgs({
+        args: cliOptionsArgs,
+        options: {
+          file: { type: "string" },
+          "dry-run": { type: "boolean", default: false },
+          "in-place": { type: "boolean", default: false },
+          vault: { type: "string" },
+          json: { type: "boolean", default: false },
+        },
+        allowPositionals: true,
+      });
+
+      const targetFile = values.file ?? positionals[0];
+      if (!targetFile) {
+        console.error("Error: Target file required. Usage: llm-vault absorb <file> [--dry-run]");
+        return 1;
+      }
+
+      const session = await loadSession();
+      const absorbRes = await absorbFile({
+        targetFile,
+        dryRun: values["dry-run"],
+        inPlace: values["in-place"],
+        vaultId: values.vault ?? session?.vaultId,
+        endpoint: session?.endpoint,
+        token: session?.token,
+      });
+
+      if (values.json) {
+        console.log(JSON.stringify(absorbRes, null, 2));
+      } else {
+        if (absorbRes.dryRun) {
+          console.log(`[DRY-RUN] Absorbing secrets from ${targetFile}:`);
+        } else {
+          console.log(
+            `Successfully absorbed ${absorbRes.absorbedCount} secret(s) from ${targetFile}:`,
+          );
+        }
+
+        for (const act of absorbRes.actions) {
+          console.log(`  - ${act.secretName} (line ${act.line}) -> ${act.handle}`);
+          if (act.templatePath) {
+            console.log(`    Template created: ${act.templatePath}`);
+          }
+        }
+
+        if (absorbRes.dryRun) {
+          console.log("\nRun without --dry-run to commit template and encrypt secrets.");
+        }
+      }
+
+      return 0;
+    }
+
+    case "hook": {
+      const subAction = commandArgs[0];
+      if (!subAction || subAction === "status") {
+        const status = getPreCommitHookStatus();
+        console.log("Git Pre-Commit Hook Status:");
+        console.log(`  Installed:      ${status.installed ? "YES" : "NO"}`);
+        console.log(`  Path:           ${status.hookPath || "(none)"}`);
+        console.log(`  Executable:     ${status.executable ? "YES" : "NO"}`);
+        console.log(`  llm-vault Hook: ${status.isLlmVaultHook ? "YES" : "NO"}`);
+        return status.installed ? 0 : 1;
+      }
+
+      if (subAction === "install") {
+        try {
+          const status = installPreCommitHook();
+          console.log(`Pre-commit hook successfully installed at: ${status.hookPath}`);
+          return 0;
+        } catch (err) {
+          console.error(
+            "Failed to install hook:",
+            err instanceof Error ? err.message : String(err),
+          );
+          return 1;
+        }
+      }
+
+      if (subAction === "remove") {
+        const status = removePreCommitHook();
+        console.log(`Pre-commit hook removed. (Installed: ${status.installed})`);
+        return 0;
+      }
+
+      console.error(
+        `Unknown hook action: "${subAction}". Usage: llm-vault hook [status|install|remove]`,
+      );
+      return 1;
     }
 
     default:
