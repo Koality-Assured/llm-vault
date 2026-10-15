@@ -1519,9 +1519,16 @@ export function sanitizeImportString(input: string): string {
     }
     cleaned += input[i];
   }
-  // Strip HTML / script tags
-  cleaned = cleaned.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
-  cleaned = cleaned.replace(/<[^>]+>/g, "");
+  // Iteratively strip script tags and HTML markup until fixpoint to prevent nested-tag bypasses
+  let prev = "";
+  while (cleaned !== prev) {
+    prev = cleaned;
+    cleaned = cleaned.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+    cleaned = cleaned.replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "");
+    cleaned = cleaned.replace(/<[^>]+>/g, "");
+  }
+  cleaned = cleaned.replace(/[<>]/g, "");
+
   return cleaned.trim();
 }
 
