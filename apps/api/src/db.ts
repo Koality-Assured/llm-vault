@@ -42,6 +42,7 @@ export function initSchema(sqlite: Database.Database): void {
       public_key_fingerprint TEXT NOT NULL,
       encrypted_x25519_private_key TEXT NOT NULL,
       encrypted_ed25519_private_key TEXT NOT NULL,
+      totp_secret TEXT,
       is_break_glass_admin INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL,

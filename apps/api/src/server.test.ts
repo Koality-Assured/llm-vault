@@ -1,10 +1,13 @@
+import crypto from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import { sqliteSchema } from "@llm-vault/schema/db/sqlite";
+import { generateTotpCode, generateTotpSecret } from "@llm-vault/crypto";
 import { buildServer } from "./server.js";
 import { initSchema, type VaultDatabase } from "./db.js";
+import { createMockSamlResponseXml } from "./auth.js";
 
 describe("Fastify REST API server (apps/api)", () => {
   let app: FastifyInstance;
@@ -452,6 +455,319 @@ describe("Fastify REST API server (apps/api)", () => {
         expect(log.eventHash).toMatch(/^[0-9a-f]{64}$/);
         expect(log.prevEventHash).toBeDefined();
       }
+    });
+  });
+
+  describe("Slice 3: Enterprise Backend, SSO Ceremony & Multi-Tenant Sharing", () => {
+    let enterpriseApp: FastifyInstance;
+    let enterpriseDb: VaultDatabase;
+    let entAdminToken = "";
+    let entAdminUserId = "";
+    let entTenantId = "";
+    let sharedVaultId = "";
+    let memberUserId = "";
+    let totpSecretBase32 = "";
+
+    beforeAll(async () => {
+      const sqlite = new Database(":memory:");
+      initSchema(sqlite);
+      const db = drizzle(sqlite, { schema: sqliteSchema });
+      enterpriseDb = { db, sqlite, path: ":memory:" };
+
+      enterpriseApp = buildServer({
+        database: enterpriseDb,
+        enableCors: false,
+        deploymentMode: "enterprise",
+      });
+      await enterpriseApp.ready();
+
+      const { secretBase32 } = generateTotpSecret(20);
+      totpSecretBase32 = secretBase32;
+
+      // Bootstrap enterprise break-glass admin
+      const res = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/bootstrap",
+        payload: {
+          email: "superadmin@corp.enterprise",
+          displayName: "Enterprise Break-Glass Admin",
+          kdfSalt: "1122334455661122334455661122334455661122334455661122334455661122",
+          kdfIterations: 600000,
+          clientAuthKeyHex: "aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb",
+          x25519PublicKey: "pk_x25519_admin",
+          ed25519PublicKey: "pk_ed25519_admin",
+          publicKeyFingerprint: "sha256:adminfp123",
+          encryptedX25519PrivateKey: "priv_x25519_enc",
+          encryptedEd25519PrivateKey: "priv_ed25519_enc",
+          isBreakGlassAdmin: true,
+          totpSecret: totpSecretBase32,
+        },
+      });
+
+      expect(res.statusCode).toBe(201);
+      const json = res.json();
+      entAdminToken = json.sessionToken;
+      entAdminUserId = json.userId;
+      entTenantId = json.tenantId;
+    });
+
+    afterAll(async () => {
+      await enterpriseApp.close();
+    });
+
+    it("GET /api/v1/status confirms enterprise mode", async () => {
+      const res = await enterpriseApp.inject({
+        method: "GET",
+        url: "/api/v1/status",
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().deploymentMode).toBe("enterprise");
+    });
+
+    it("POST /api/v1/auth/login rejects password login in enterprise mode with HTTP 403", async () => {
+      const res = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/login",
+        payload: {
+          email: "superadmin@corp.enterprise",
+          clientAuthKeyHex: "aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb",
+        },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toContain("disabled in enterprise mode");
+    });
+
+    it("POST /api/v1/auth/oidc/authorize and /callback execute PKCE flow and require unlock ceremony", async () => {
+      const codeVerifier = crypto.randomBytes(32).toString("base64url");
+      const codeChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+
+      const authRes = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/oidc/authorize",
+        payload: {
+          email: "saml_alice@corp.enterprise",
+          name: "Alice Engineer",
+          tenantId: entTenantId,
+          codeChallenge,
+        },
+      });
+      expect(authRes.statusCode).toBe(200);
+      const { code } = authRes.json();
+      expect(code).toMatch(/^oidc_code_/);
+
+      const callbackRes = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/oidc/callback",
+        payload: {
+          code,
+          codeVerifier,
+          tenantId: entTenantId,
+        },
+      });
+
+      expect(callbackRes.statusCode).toBe(200);
+      const json = callbackRes.json();
+      expect(json.email).toBe("saml_alice@corp.enterprise");
+      expect(json.sessionToken).toMatch(/^vlt_session_/);
+      expect(json.unlockRequired).toBe(true);
+      memberUserId = json.userId;
+    });
+
+    it("POST /api/v1/auth/saml/login and /callback execute SAML 2.0 assertion flow", async () => {
+      const loginRes = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/saml/login",
+        payload: { tenantId: entTenantId },
+      });
+      expect(loginRes.statusCode).toBe(200);
+      expect(loginRes.json().ssoUrl).toBe("/api/v1/auth/saml/callback");
+
+      const samlXml = createMockSamlResponseXml({
+        email: "saml_bob@corp.enterprise",
+        name: "Bob Operator",
+        sub: "usr_saml_bob_123",
+      });
+      const samlResponse = Buffer.from(samlXml).toString("base64");
+
+      const callbackRes = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/saml/callback",
+        payload: {
+          samlResponse,
+          tenantId: entTenantId,
+        },
+      });
+
+      expect(callbackRes.statusCode).toBe(200);
+      const json = callbackRes.json();
+      expect(json.email).toBe("saml_bob@corp.enterprise");
+      expect(json.sessionToken).toMatch(/^vlt_session_/);
+      expect(json.unlockRequired).toBe(true);
+    });
+
+    it("POST /api/v1/auth/break-glass/login validates TOTP code and logs critical audit event", async () => {
+      // Reject invalid TOTP code
+      const failRes = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/break-glass/login",
+        payload: {
+          email: "superadmin@corp.enterprise",
+          clientAuthKeyHex: "aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb",
+          totpCode: "000000",
+          reason: "Emergency recovery from IdP outage",
+        },
+      });
+      expect(failRes.statusCode).toBe(401);
+
+      // Successful break-glass login with valid TOTP
+      const validCode = await generateTotpCode(totpSecretBase32);
+      const successRes = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/auth/break-glass/login",
+        payload: {
+          email: "superadmin@corp.enterprise",
+          clientAuthKeyHex: "aabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabbccddeeffaabb",
+          totpCode: validCode,
+          reason: "Emergency recovery from IdP outage",
+        },
+      });
+
+      expect(successRes.statusCode).toBe(200);
+      const json = successRes.json();
+      expect(json.isBreakGlass).toBe(true);
+      expect(json.sessionToken).toMatch(/^vlt_session_/);
+    });
+
+    it("Multi-Tenant Isolation: SuperAdmin can create and list independent tenants", async () => {
+      const res = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/tenants",
+        headers: { authorization: `Bearer ${entAdminToken}` },
+        payload: {
+          name: "Acme Healthcare Subsidiary",
+          slug: "acme-health",
+          deploymentMode: "enterprise",
+        },
+      });
+
+      expect(res.statusCode).toBe(201);
+      const json = res.json();
+      expect(json.slug).toBe("acme-health");
+      expect(json.id).toMatch(/^tnt_/);
+
+      const listRes = await enterpriseApp.inject({
+        method: "GET",
+        url: "/api/v1/tenants",
+        headers: { authorization: `Bearer ${entAdminToken}` },
+      });
+      expect(listRes.statusCode).toBe(200);
+      expect(listRes.json().tenants.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it("Multi-User Vault Sharing: VaultAdmin shares vault with member using recipient-wrapped key", async () => {
+      // 1. Create a vault
+      const vltRes = await enterpriseApp.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${entAdminToken}` },
+        payload: {
+          name: "Enterprise Shared Infrastructure",
+          description: "Secrets shared with engineering members",
+          encryptedVaultKey: {
+            ciphertext: "admin_wrapped_vault_key_v1",
+            iv: "iv_1234567890123456",
+            authTag: "auth_tag_1234567890123456",
+            aad: "vault-share:vlt_shared:1",
+            keyVersion: 1,
+          },
+        },
+      });
+      expect(vltRes.statusCode).toBe(201);
+      sharedVaultId = vltRes.json().id;
+
+      // 2. Share vault with Alice (memberUserId)
+      const shareRes = await enterpriseApp.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${sharedVaultId}/members`,
+        headers: { authorization: `Bearer ${entAdminToken}` },
+        payload: {
+          userId: memberUserId,
+          vaultRole: "SecretEditor",
+          encryptedVaultKey: {
+            ciphertext: "alice_wrapped_vault_key_v1",
+            iv: "iv_alice_12345678901234",
+            authTag: "auth_tag_alice_1234567890",
+            aad: `vault-share:${sharedVaultId}:1`,
+            keyVersion: 1,
+          },
+        },
+      });
+      expect(shareRes.statusCode).toBe(201);
+      expect(shareRes.json().userId).toBe(memberUserId);
+
+      // 3. List members
+      const listMemRes = await enterpriseApp.inject({
+        method: "GET",
+        url: `/api/v1/vaults/${sharedVaultId}/members`,
+        headers: { authorization: `Bearer ${entAdminToken}` },
+      });
+      expect(listMemRes.statusCode).toBe(200);
+      const members = listMemRes.json().members;
+      expect(members.some((m: { userId: string }) => m.userId === memberUserId)).toBe(true);
+    });
+
+    it("Member revocation flags mandatory VaultKey rotation and POST /rotate-key commits key_version + 1", async () => {
+      // 1. Revoke Alice from vault
+      const revokeRes = await enterpriseApp.inject({
+        method: "DELETE",
+        url: `/api/v1/vaults/${sharedVaultId}/members/${memberUserId}`,
+        headers: { authorization: `Bearer ${entAdminToken}` },
+      });
+      expect(revokeRes.statusCode).toBe(200);
+      expect(revokeRes.json().rotationRequired).toBe(true);
+
+      // Verify GET /api/v1/vaults/:id shows rotationRequired: true
+      const getVaultRes = await enterpriseApp.inject({
+        method: "GET",
+        url: `/api/v1/vaults/${sharedVaultId}`,
+        headers: { authorization: `Bearer ${entAdminToken}` },
+      });
+      expect(getVaultRes.statusCode).toBe(200);
+      expect(getVaultRes.json().vault.rotationRequired).toBe(true);
+
+      // 2. Perform mandatory key rotation to keyVersion 2
+      const rotateRes = await enterpriseApp.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${sharedVaultId}/rotate-key`,
+        headers: { authorization: `Bearer ${entAdminToken}` },
+        payload: {
+          newKeyVersion: 2,
+          memberKeys: [
+            {
+              userId: entAdminUserId, // remaining admin
+              encryptedVaultKey: "admin_wrapped_vault_key_v2",
+              iv: "iv_admin_v2_123456789012",
+              authTag: "tag_admin_v2_123456789012",
+              aad: `vault-share:${sharedVaultId}:2`,
+            },
+          ],
+        },
+      });
+      expect(rotateRes.statusCode).toBe(200);
+      const rotatedJson = rotateRes.json();
+      expect(rotatedJson.status).toBe("rotated");
+      expect(rotatedJson.keyVersion).toBe(2);
+      expect(rotatedJson.rotationRequired).toBe(false);
+
+      // Verify GET /api/v1/vaults/:id reflects keyVersion 2 and rotationRequired: false
+      const verifyRes = await enterpriseApp.inject({
+        method: "GET",
+        url: `/api/v1/vaults/${sharedVaultId}`,
+        headers: { authorization: `Bearer ${entAdminToken}` },
+      });
+      expect(verifyRes.statusCode).toBe(200);
+      expect(verifyRes.json().vault.keyVersion).toBe(2);
+      expect(verifyRes.json().vault.rotationRequired).toBe(false);
     });
   });
 });
