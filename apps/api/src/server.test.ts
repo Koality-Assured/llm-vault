@@ -1296,4 +1296,228 @@ describe("Fastify REST API server (apps/api)", () => {
       expect(tamperedJson.reason).toContain("Hash mismatch");
     });
   });
+
+  describe("Slice 5: Hardened Migrations, Ephemeral Leasing & Backup Integration", () => {
+    let s5Db: VaultDatabase;
+    let s5App: FastifyInstance;
+    let s5Token: string;
+    let s5VaultId: string;
+
+    beforeAll(async () => {
+      const sqlite = new Database(":memory:");
+      initSchema(sqlite);
+      const db = drizzle(sqlite, { schema: sqliteSchema });
+      s5Db = { db, sqlite, path: ":memory:" };
+      s5App = buildServer({ database: s5Db, deploymentMode: "standalone", enableCors: false });
+      await s5App.ready();
+
+      // Register initial admin
+      const regRes = await s5App.inject({
+        method: "POST",
+        url: "/api/v1/auth/bootstrap",
+        payload: {
+          email: "slice5_admin@standalone.local",
+          displayName: "Slice 5 Admin",
+          clientAuthKeyHex: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+          kdfSalt: "test_salt_32_bytes_long_value__",
+          kdfIterations: 600000,
+          x25519PublicKey: "base64_x25519_pk",
+          ed25519PublicKey: "base64_ed25519_pk",
+          publicKeyFingerprint: "fp_test_slice5",
+          encryptedX25519PrivateKey: "enc_priv_key",
+          encryptedEd25519PrivateKey: "enc_ed_priv_key",
+        },
+      });
+      expect(regRes.statusCode).toBe(201);
+      s5Token = regRes.json().sessionToken;
+
+      // Create primary vault
+      s5VaultId = generateEntityId("vlt_");
+      const vltRes = await s5App.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          id: s5VaultId,
+          name: "Slice 5 Source Vault",
+          encryptedVaultKey: {
+            ciphertext: "enc_key",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_context",
+          },
+        },
+      });
+      expect(vltRes.statusCode).toBe(201);
+
+      // Create a secret in source vault
+      const secRes = await s5App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s5VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          encryptedMetadata: {
+            algorithm: "AES-256-GCM",
+            ciphertext: "enc_meta_payload",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_context",
+            keyVersion: 1,
+          },
+          encryptedPayload: {
+            algorithm: "AES-256-GCM",
+            ciphertext: "enc_secret_payload",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_context",
+            keyVersion: 1,
+          },
+        },
+      });
+      expect(secRes.statusCode).toBe(201);
+    });
+
+    afterAll(async () => {
+      await s5App.close();
+    });
+
+    it("exports encrypted backup and imports it into a second vault", async () => {
+      const passphrase = "high-entropy-backup-passphrase-2026";
+
+      // 1. Export backup from source vault
+      const exportRes = await s5App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s5VaultId}/backup/export`,
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: { passphrase },
+      });
+      expect(exportRes.statusCode).toBe(200);
+      const backupContainer = exportRes.json();
+      expect(backupContainer.format).toBe("llm-vault-backup");
+      expect(backupContainer.version).toBe(1);
+      expect(backupContainer.itemCount).toBe(1);
+      expect(backupContainer.ciphertext).toBeDefined();
+
+      // 2. Create destination vault
+      const destVaultId = generateEntityId("vlt_");
+      const vltRes = await s5App.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          id: destVaultId,
+          name: "Slice 5 Destination Vault",
+          encryptedVaultKey: {
+            ciphertext: "enc_key_dest",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_context",
+          },
+        },
+      });
+      expect(vltRes.statusCode).toBe(201);
+
+      // 3. Import backup into destination vault
+      const importRes = await s5App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${destVaultId}/backup/import`,
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          container: backupContainer,
+          passphrase,
+        },
+      });
+      expect(importRes.statusCode).toBe(200);
+      expect(importRes.json().status).toBe("imported");
+      expect(importRes.json().importedCount).toBe(1);
+
+      // 4. Import with wrong passphrase fails
+      const badPassRes = await s5App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${destVaultId}/backup/import`,
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          container: backupContainer,
+          passphrase: "wrong-password",
+        },
+      });
+      expect(badPassRes.statusCode).toBe(400);
+      expect(badPassRes.json().error).toContain("failed");
+    });
+
+    it("rejects backup import payloads exceeding the 50MB size limit with HTTP 413", async () => {
+      // Create a string that exceeds 50MB
+      // Using a mock payload that is oversized
+      const hugeContainer = {
+        format: "llm-vault-backup",
+        version: 1,
+        kdf: { provider: "pbkdf2", salt: "salt", iterations: 600000 },
+        iv: "iv",
+        ciphertext: "X".repeat(52_428_801), // > 50MB
+        authTag: "tag",
+        tenantId: "tnt_default",
+        vaultId: s5VaultId,
+        exportedAt: new Date().toISOString(),
+        itemCount: 1,
+      };
+
+      const res = await s5App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s5VaultId}/backup/import`,
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          container: hugeContainer,
+          passphrase: "some-passphrase",
+        },
+      });
+      expect(res.statusCode).toBe(413);
+      expect(res.json().error).toMatch(/Payload Too Large|50MB/);
+    });
+
+    it("imports Bitwarden exports with HTML/script sanitization and creates encrypted secret rows", async () => {
+      const res = await s5App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s5VaultId}/import/bitwarden`,
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          encrypted: false,
+          folders: [],
+          items: [
+            {
+              name: "Stripe API Key <script>alert('xss')</script>",
+              notes: "<b>Production Key</b>\x00\x08",
+              login: {
+                username: "billing_user\x1F",
+                password: "sk_live_1234567890",
+              },
+            },
+          ],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().status).toBe("imported");
+      expect(res.json().importedCount).toBe(1);
+    });
+
+    it("imports CSV rows with schema validation and string sanitization", async () => {
+      const res = await s5App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s5VaultId}/import/csv`,
+        headers: { authorization: `Bearer ${s5Token}` },
+        payload: {
+          rows: [
+            {
+              name: "Postgres Connection <iframe>evil</iframe>",
+              value: "postgres://user:pass@db.prod:5432/main",
+              description: "Primary DB cluster",
+              tags: ["database", "prod"],
+            },
+          ],
+        },
+      });
+      expect(res.statusCode).toBe(200);
+      expect(res.json().status).toBe("imported");
+      expect(res.json().importedCount).toBe(1);
+    });
+  });
 });

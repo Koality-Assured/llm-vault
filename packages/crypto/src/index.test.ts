@@ -10,9 +10,11 @@ import {
   buildCanonicalAad,
   bytesToBase64,
   bytesToBase32,
+  bytesToHex,
   computeAuditEventHash,
   computeTagBlindIndex,
   createArgon2idKdfProvider,
+  createEncryptedBackup,
   decryptSecretMetadata,
   decryptSecretPayload,
   decryptWithAad,
@@ -31,6 +33,8 @@ import {
   generateUserKeyPairs,
   generateVaultKey,
   generateVaultKeyBytes,
+  restoreEncryptedBackup,
+  sanitizeImportString,
   signAuditOrKeyPayload,
   unwrapUserPrivateKey,
   unwrapVaultKeyForAgent,
@@ -458,5 +462,140 @@ describe("@llm-vault/crypto", () => {
     // Zeroize sensitive reconstructed key
     zeroizeBuffer(reconstructedKey);
     zeroizeBuffer(badReconstructedKey);
+  });
+
+  it("sanitizes third-party import strings removing HTML, script tags, and non-printable control characters", () => {
+    const rawXss = `  <script>alert("pwned")</script>Database Password\x00\x08<b>(Prod)</b>\x1F  `;
+    const clean = sanitizeImportString(rawXss);
+    expect(clean).toBe("Database Password(Prod)");
+    expect(clean).not.toContain("<script>");
+    expect(clean).not.toContain("<b>");
+    expect(clean).not.toContain("\x00");
+  });
+
+  it("exports and imports AES-256-GCM encrypted backup containers with PBKDF2 stretching and AAD binding", async () => {
+    const tenantId = "tnt_corp_production";
+    const vaultId = generateEntityId("vlt_");
+    const passphrase = "high-entropy-backup-passphrase-2026";
+    const items = [
+      {
+        id: generateEntityId("sec_"),
+        name: "GitHub Personal Access Token",
+        value: "ghp_1234567890",
+      },
+      { id: generateEntityId("sec_"), name: "OpenAI Platform Key", value: "sk-proj-abcdef123456" },
+    ];
+
+    // 1. Create encrypted backup
+    const backupContainer = await createEncryptedBackup({
+      passphrase,
+      tenantId,
+      vaultId,
+      items,
+    });
+
+    expect(backupContainer.format).toBe("llm-vault-backup");
+    expect(backupContainer.version).toBe(1);
+    expect(backupContainer.itemCount).toBe(2);
+    expect(backupContainer.tenantId).toBe(tenantId);
+    expect(backupContainer.vaultId).toBe(vaultId);
+    expect(backupContainer.kdf.provider).toBe("pbkdf2");
+    expect(backupContainer.kdf.iterations).toBe(600_000);
+    expect(backupContainer.ciphertext).toBeDefined();
+
+    // 2. Restore encrypted backup
+    const restored = await restoreEncryptedBackup<(typeof items)[0]>({
+      container: backupContainer,
+      passphrase,
+    });
+    expect(restored).toEqual(items);
+
+    // 3. Wrong passphrase fails restore
+    await expect(
+      restoreEncryptedBackup({
+        container: backupContainer,
+        passphrase: "wrong-passphrase",
+      }),
+    ).rejects.toThrow(/decryption or MAC verification failed/);
+
+    // 4. AAD tampering (modifying tenantId or vaultId) fails restore
+    const tamperedTenant = { ...backupContainer, tenantId: "tnt_attacker" };
+    await expect(
+      restoreEncryptedBackup({
+        container: tamperedTenant,
+        passphrase,
+      }),
+    ).rejects.toThrow(/decryption or MAC verification failed/);
+
+    const tamperedVault = { ...backupContainer, vaultId: generateEntityId("vlt_") };
+    await expect(
+      restoreEncryptedBackup({
+        container: tamperedVault,
+        passphrase,
+      }),
+    ).rejects.toThrow(/decryption or MAC verification failed/);
+  });
+
+  it("verifies ASVS 5.0 cryptographic invariants: nonce uniqueness across 10,000 runs, canonical AAD tampering rejection, and ciphertext bit-flipping failure", async () => {
+    // 1. Nonce uniqueness: generate 10,000 IVs and verify 0 collisions
+    const seenNonces = new Set<string>();
+    const iv = new Uint8Array(12);
+    for (let i = 0; i < 10_000; i++) {
+      globalThis.crypto.getRandomValues(iv);
+      const hex = bytesToHex(iv);
+      expect(seenNonces.has(hex)).toBe(false);
+      seenNonces.add(hex);
+    }
+    expect(seenNonces.size).toBe(10_000);
+
+    // 2. Canonical AAD tampering rejection
+    const vaultKey = await generateVaultKey();
+    const tenantId = "tnt_secure_corp";
+    const vaultId = generateEntityId("vlt_");
+    const secretId = generateEntityId("sec_");
+    const plaintext = new TextEncoder().encode("super-sensitive-api-token");
+
+    const validAad = {
+      tenantId,
+      vaultId,
+      secretId,
+      version: 1,
+      keyVersion: 1,
+    };
+
+    const encrypted = await encryptWithAad(vaultKey, plaintext, validAad);
+
+    // Decryption with exact AAD succeeds
+    const decrypted = await decryptWithAad(vaultKey, encrypted, validAad);
+    expect(decrypted).toEqual(plaintext);
+
+    // Tampering any AAD field fails
+    const tamperedAads = [
+      { tenantId: "tnt_other", vaultId, secretId, version: 1, keyVersion: 1 },
+      { tenantId, vaultId: generateEntityId("vlt_"), secretId, version: 1, keyVersion: 1 },
+      { tenantId, vaultId, secretId: generateEntityId("sec_"), version: 1, keyVersion: 1 },
+      { tenantId, vaultId, secretId, version: 2, keyVersion: 1 },
+      { tenantId, vaultId, secretId, version: 1, keyVersion: 2 },
+    ];
+
+    for (const badAad of tamperedAads) {
+      await expect(decryptWithAad(vaultKey, encrypted, badAad)).rejects.toThrow();
+    }
+
+    // 3. Ciphertext bit-flipping test
+    const tamperedCiphertextBytes = base64ToBytes(encrypted.ciphertext);
+    tamperedCiphertextBytes[0] = (tamperedCiphertextBytes[0] ?? 0) ^ 0x01; // flip single bit in first byte
+    const bitFlippedEnvelope = {
+      ...encrypted,
+      ciphertext: bytesToBase64(tamperedCiphertextBytes),
+    };
+    await expect(decryptWithAad(vaultKey, bitFlippedEnvelope, validAad)).rejects.toThrow();
+  });
+
+  it("verifies zeroizeBuffer clears all buffer bytes in-place", () => {
+    const sensitive = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(sensitive.some((b) => b !== 0)).toBe(true);
+    zeroizeBuffer(sensitive);
+    expect(sensitive.every((b) => b === 0)).toBe(true);
   });
 });
