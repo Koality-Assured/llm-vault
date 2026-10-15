@@ -24,8 +24,11 @@ import {
   SecretMetadataSchema,
   SecretPayloadSchema,
   SystemRoleSchema,
+  SYSTEM_ROLE_PERMISSIONS,
   VAULT_ROLE_PERMISSIONS,
   VaultRoleSchema,
+  InitiateRecoveryRequestSchema,
+  AdminCreateUserRequestSchema,
   isMcpAllowedScope,
   postgresSchema,
   sqliteSchema,
@@ -40,6 +43,13 @@ describe("@llm-vault/schema", () => {
     expect(SystemRoleSchema.parse("SuperAdmin")).toBe("SuperAdmin");
     expect(VaultRoleSchema.parse("SecretReader")).toBe("SecretReader");
 
+    // System role permissions
+    expect(SYSTEM_ROLE_PERMISSIONS.SuperAdmin).toContain("admin:users:manage");
+    expect(SYSTEM_ROLE_PERMISSIONS.SuperAdmin).toContain("admin:idp:manage");
+    expect(SYSTEM_ROLE_PERMISSIONS.SecurityAdmin).toContain("admin:audit:read");
+    expect(SYSTEM_ROLE_PERMISSIONS.SecurityAdmin).not.toContain("admin:users:manage");
+    expect(SYSTEM_ROLE_PERMISSIONS.ComplianceAuditor).toEqual(["admin:audit:read"]);
+
     // SecretReader has metadata-only visibility (never secrets:reveal)
     expect(VAULT_ROLE_PERMISSIONS.SecretReader).toEqual(["secrets:read"]);
     expect(VAULT_ROLE_PERMISSIONS.SecretReader).not.toContain("secrets:reveal");
@@ -50,6 +60,21 @@ describe("@llm-vault/schema", () => {
     expect(isMcpAllowedScope("admin:idp:manage")).toBe(false);
     expect(isMcpAllowedScope("admin:audit:read")).toBe(true);
     expect(isMcpAllowedScope("agent:exec:run")).toBe(true);
+
+    // Slice 4 Schemas
+    const adminUser = AdminCreateUserRequestSchema.parse({
+      email: "secadmin@example.com",
+      displayName: "Security Admin",
+      systemRole: "SecurityAdmin",
+    });
+    expect(adminUser.systemRole).toBe("SecurityAdmin");
+
+    const recReq = InitiateRecoveryRequestSchema.parse({
+      vaultId: generateEntityId("vlt_"),
+      reason: "Emergency recovery test",
+      initiatorShare: "share123",
+    });
+    expect(recReq.reason).toBe("Emergency recovery test");
   });
 
   it("validates CreateSecretRequestSchema and RevealSecretResponseSchema with real WebCrypto envelopes", async () => {
@@ -191,9 +216,12 @@ describe("@llm-vault/schema", () => {
       "agents",
       "auditLogs",
       "folders",
+      "idpConfigs",
+      "recoveryRequests",
       "secretTagIndexes",
       "secretVersions",
       "secrets",
+      "siemConfigs",
       "tenants",
       "users",
       "vaultMemberKeys",

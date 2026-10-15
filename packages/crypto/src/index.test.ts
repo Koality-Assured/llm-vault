@@ -40,6 +40,11 @@ import {
   verifyTotpCode,
   wrapUserPrivateKey,
   wrapVaultKeyForAgent,
+  combineRecoveryKey,
+  generateOrgRecoveryKeyPair,
+  splitRecoveryKey,
+  unwrapVaultKeyWithOrgRecoveryKey,
+  wrapVaultKeyWithOrgRecoveryKey,
   wrapVaultKeyForRecipient,
   zeroizeBuffer,
 } from "./index.js";
@@ -407,5 +412,51 @@ describe("@llm-vault/crypto", () => {
       window: 1,
     });
     expect(expired).toBe(false);
+  });
+
+  it("supports dual-control organization recovery escrow with split keys and X25519 wrapping", async () => {
+    // 1. Generate Org Recovery Keypair
+    const { publicKey, privateKeyBytes } = await generateOrgRecoveryKeyPair();
+    expect(typeof publicKey).toBe("string");
+    expect(privateKeyBytes.byteLength).toBe(32);
+
+    // 2. Split private key into 2 shares
+    const { share1, share2 } = splitRecoveryKey(privateKeyBytes);
+    expect(share1).not.toBe(share2);
+
+    // 3. Wrap a vault key with the OrgRecoveryPublicKey
+    const vaultId = generateEntityId("vlt_");
+    const vaultKeyBytes = generateVaultKeyBytes();
+    const wrappedRecoveryBlob = await wrapVaultKeyWithOrgRecoveryKey(
+      vaultKeyBytes,
+      publicKey,
+      vaultId,
+      1,
+    );
+    expect(wrappedRecoveryBlob.aad).toBe(`org-recovery:${vaultId}:1`);
+    expect(wrappedRecoveryBlob.ephemeralPublicKey).toBeDefined();
+
+    // 4. Combine shares to reconstruct recovery private key
+    const reconstructedKey = combineRecoveryKey(share1, share2);
+    expect(reconstructedKey).toEqual(privateKeyBytes);
+
+    // 5. Unwrap vault key using reconstructed recovery private key
+    const recoveredVaultKey = await unwrapVaultKeyWithOrgRecoveryKey(
+      wrappedRecoveryBlob,
+      reconstructedKey,
+      vaultId,
+    );
+    expect(recoveredVaultKey).toEqual(vaultKeyBytes);
+
+    // 6. Verification with wrong share fails
+    const corruptedShare2 = "00".repeat(32);
+    const badReconstructedKey = combineRecoveryKey(share1, corruptedShare2);
+    await expect(
+      unwrapVaultKeyWithOrgRecoveryKey(wrappedRecoveryBlob, badReconstructedKey, vaultId),
+    ).rejects.toThrow();
+
+    // Zeroize sensitive reconstructed key
+    zeroizeBuffer(reconstructedKey);
+    zeroizeBuffer(badReconstructedKey);
   });
 });

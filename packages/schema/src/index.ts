@@ -66,6 +66,31 @@ export function isMcpAllowedScope(scope: PermissionScope): boolean {
   return !HUMAN_ADMIN_ONLY_SET.has(scope);
 }
 
+export const SYSTEM_ROLE_PERMISSIONS: Readonly<Record<SystemRole, readonly PermissionScope[]>> = {
+  SuperAdmin: [
+    "admin:users:manage",
+    "admin:roles:manage",
+    "admin:idp:manage",
+    "admin:audit:read",
+    "vaults:create",
+    "vaults:manage",
+    "vaults:share",
+    "vaults:rotate_key",
+    "agent:token:create",
+    "agent:token:revoke",
+    "secrets:create",
+    "secrets:read",
+    "secrets:reveal",
+    "secrets:update",
+    "secrets:delete",
+    "secrets:rollback",
+    "secrets:export",
+  ],
+  SecurityAdmin: ["admin:audit:read", "admin:roles:manage", "agent:token:revoke", "secrets:read"],
+  UserAdmin: ["admin:users:manage"],
+  ComplianceAuditor: ["admin:audit:read"],
+};
+
 export const VAULT_ROLE_PERMISSIONS: Readonly<Record<VaultRole, readonly PermissionScope[]>> = {
   WorkspaceOwner: [
     "vaults:create",
@@ -340,3 +365,71 @@ export const CreateTenantRequestSchema = z.object({
   orgRecoveryPublicKey: z.string().optional(),
 });
 export type CreateTenantRequest = z.infer<typeof CreateTenantRequestSchema>;
+
+export const OrgRecoveryKeyEnvelopeSchema = z.object({
+  encryptedVaultKey: z.string().min(1),
+  iv: z.string().min(16),
+  authTag: z.string().min(20),
+  aad: z.string().min(1),
+  ephemeralPublicKey: z.string().min(1),
+  keyVersion: z.number().int().min(1),
+});
+export type OrgRecoveryKeyEnvelope = z.infer<typeof OrgRecoveryKeyEnvelopeSchema>;
+
+export const InitiateRecoveryRequestSchema = z.object({
+  vaultId: VaultIdSchema,
+  reason: z.string().min(5).max(1024),
+  initiatorShare: z.string().min(1),
+});
+export type InitiateRecoveryRequest = z.infer<typeof InitiateRecoveryRequestSchema>;
+
+export const ApproveRecoveryRequestSchema = z.object({
+  recoveryId: z.string().min(1),
+  approverShare: z.string().min(1),
+});
+export type ApproveRecoveryRequest = z.infer<typeof ApproveRecoveryRequestSchema>;
+
+export const AdminCreateUserRequestSchema = z.object({
+  email: z.string().email(),
+  displayName: z.string().min(1).max(256),
+  systemRole: SystemRoleSchema.optional(),
+  status: z.enum(["active", "suspended"]).default("active"),
+});
+export type AdminCreateUserRequest = z.infer<typeof AdminCreateUserRequestSchema>;
+
+export const AdminUpdateUserRequestSchema = z.object({
+  displayName: z.string().min(1).max(256).optional(),
+  systemRole: SystemRoleSchema.optional(),
+  status: z.enum(["active", "suspended"]).optional(),
+});
+export type AdminUpdateUserRequest = z.infer<typeof AdminUpdateUserRequestSchema>;
+
+export const AdminUpdateIdpRequestSchema = z.object({
+  providerType: z.enum(["saml", "oidc"]),
+  issuer: z.string().min(1),
+  clientId: z.string().optional(),
+  clientSecret: z.string().optional(),
+  authorizationEndpoint: z.string().url().optional(),
+  tokenEndpoint: z.string().url().optional(),
+  ssoUrl: z.string().url().optional(),
+  certificate: z.string().optional(),
+  enabled: z.boolean().default(true),
+});
+export type AdminUpdateIdpRequest = z.infer<typeof AdminUpdateIdpRequestSchema>;
+
+export const AdminSiemConfigRequestSchema = z.object({
+  webhookUrl: z.string().url(),
+  sharedSecret: z.string().min(8),
+  enabled: z.boolean().default(true),
+});
+export type AdminSiemConfigRequest = z.infer<typeof AdminSiemConfigRequestSchema>;
+
+export const VerifyAuditLogsResponseSchema = z.object({
+  valid: z.boolean(),
+  totalEvents: z.number().int().nonnegative(),
+  genesisHash: z.string(),
+  latestHash: z.string(),
+  failedEventId: z.string().optional(),
+  reason: z.string().optional(),
+});
+export type VerifyAuditLogsResponse = z.infer<typeof VerifyAuditLogsResponseSchema>;

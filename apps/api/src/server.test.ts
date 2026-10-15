@@ -3,8 +3,17 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import Database from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
+import { eq } from "drizzle-orm";
 import { sqliteSchema } from "@llm-vault/schema/db/sqlite";
-import { generateTotpCode, generateTotpSecret } from "@llm-vault/crypto";
+import { generateEntityId } from "@llm-vault/ids";
+import {
+  generateOrgRecoveryKeyPair,
+  generateTotpCode,
+  generateTotpSecret,
+  generateVaultKeyBytes,
+  splitRecoveryKey,
+  wrapVaultKeyWithOrgRecoveryKey,
+} from "@llm-vault/crypto";
 import { buildServer } from "./server.js";
 import { initSchema, type VaultDatabase } from "./db.js";
 import { createMockSamlResponseXml } from "./auth.js";
@@ -768,6 +777,523 @@ describe("Fastify REST API server (apps/api)", () => {
       expect(verifyRes.statusCode).toBe(200);
       expect(verifyRes.json().vault.keyVersion).toBe(2);
       expect(verifyRes.json().vault.rotationRequired).toBe(false);
+    });
+  });
+
+  describe("Slice 4: Enterprise RBAC, Dual-Control Escrow & Hash-Chained Audit Plane", () => {
+    let slice4App: FastifyInstance;
+    let slice4Db: VaultDatabase;
+    let superAdminToken = "";
+    let secAdminToken = "";
+    let userAdminToken = "";
+    let auditorToken = "";
+    let readerToken = "";
+    let slice4TenantId = "";
+    let slice4VaultId = "";
+    let recoveryShare1 = "";
+    let recoveryShare2 = "";
+    let orgRecoveryPubKey = "";
+
+    beforeAll(async () => {
+      const sqlite = new Database(":memory:");
+      initSchema(sqlite);
+      const db = drizzle(sqlite, { schema: sqliteSchema });
+      slice4Db = { db, sqlite, path: ":memory:" };
+
+      slice4App = buildServer({
+        database: slice4Db,
+        deploymentMode: "enterprise",
+        enableCors: false,
+      });
+      await slice4App.ready();
+
+      // Bootstrap SuperAdmin via Break-Glass
+      const totp = generateTotpSecret(20);
+      const now = new Date().toISOString();
+      const bgSalt = crypto.randomBytes(32).toString("hex");
+      const clientAuthKey = "super_admin_auth_key_12345";
+      const serverHash = crypto.scryptSync(clientAuthKey, bgSalt, 32).toString("hex");
+
+      const tList = slice4Db.db.select().from(sqliteSchema.tenants).all();
+      slice4TenantId = tList[0]!.id;
+
+      slice4Db.db
+        .insert(sqliteSchema.users)
+        .values({
+          id: "usr_superadmin_01",
+          tenantId: slice4TenantId,
+          email: "superadmin@enterprise.local",
+          displayName: "Super Administrator",
+          systemRole: "SuperAdmin",
+          kdfSalt: bgSalt,
+          serverPasswordHash: serverHash,
+          totpSecret: totp.secretBase32,
+          isBreakGlassAdmin: true,
+          x25519PublicKey: "placeholder_pub",
+          ed25519PublicKey: "placeholder_pub",
+          publicKeyFingerprint: "fingerprint_01",
+          encryptedX25519PrivateKey: "placeholder_priv",
+          encryptedEd25519PrivateKey: "placeholder_priv",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      const bgCode = await generateTotpCode(totp.secretBase32, Date.now());
+      const bgRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/auth/break-glass/login",
+        payload: {
+          email: "superadmin@enterprise.local",
+          clientAuthKeyHex: clientAuthKey,
+          totpCode: bgCode,
+          reason: "Slice 4 bootstrap initialization",
+        },
+      });
+      expect(bgRes.statusCode).toBe(200);
+      superAdminToken = bgRes.json().sessionToken;
+
+      slice4Db.db
+        .insert(sqliteSchema.vaults)
+        .values({
+          id: "vlt_slice4_agent_vault_01",
+          tenantId: slice4TenantId,
+          name: "Agent Test Vault",
+          description: "Vault for testing agent separation",
+          keyVersion: 1,
+          createdByUserId: "usr_superadmin_01",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      // Create SecurityAdmin user via SuperAdmin
+      const secUserRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/admin/users",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          email: "secadmin@enterprise.local",
+          displayName: "Security Administrator",
+          systemRole: "SecurityAdmin",
+        },
+      });
+      expect(secUserRes.statusCode).toBe(201);
+      const secUserId = secUserRes.json().id;
+
+      // Create UserAdmin user
+      const uAdminRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/admin/users",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          email: "useradmin@enterprise.local",
+          displayName: "User Administrator",
+          systemRole: "UserAdmin",
+        },
+      });
+      expect(uAdminRes.statusCode).toBe(201);
+      const uAdminId = uAdminRes.json().id;
+
+      // Create ComplianceAuditor user
+      const auditUserRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/admin/users",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          email: "auditor@enterprise.local",
+          displayName: "Compliance Auditor",
+          systemRole: "ComplianceAuditor",
+        },
+      });
+      expect(auditUserRes.statusCode).toBe(201);
+      const auditorId = auditUserRes.json().id;
+
+      // Create regular user for SecretReader
+      const readerUserRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/admin/users",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          email: "reader@enterprise.local",
+          displayName: "Secret Reader",
+        },
+      });
+      expect(readerUserRes.statusCode).toBe(201);
+      const readerId = readerUserRes.json().id;
+
+      // Issue mock session tokens for testing RBAC
+      const { issueSessionToken } = await import("./auth.js");
+      secAdminToken = issueSessionToken({
+        actorId: secUserId,
+        actorType: "user",
+        tenantId: slice4TenantId,
+        email: "secadmin@enterprise.local",
+        displayName: "Security Administrator",
+        systemRole: "SecurityAdmin",
+        scopes: ["admin:audit:read", "admin:roles:manage", "agent:token:revoke", "secrets:read"],
+      });
+
+      userAdminToken = issueSessionToken({
+        actorId: uAdminId,
+        actorType: "user",
+        tenantId: slice4TenantId,
+        email: "useradmin@enterprise.local",
+        displayName: "User Administrator",
+        systemRole: "UserAdmin",
+        scopes: ["admin:users:manage"],
+      });
+
+      auditorToken = issueSessionToken({
+        actorId: auditorId,
+        actorType: "user",
+        tenantId: slice4TenantId,
+        email: "auditor@enterprise.local",
+        displayName: "Compliance Auditor",
+        systemRole: "ComplianceAuditor",
+        scopes: ["admin:audit:read"],
+      });
+
+      readerToken = issueSessionToken({
+        actorId: readerId,
+        actorType: "user",
+        tenantId: slice4TenantId,
+        email: "reader@enterprise.local",
+        displayName: "Secret Reader",
+        systemRole: "SecretConsumer",
+        scopes: ["secrets:read", "secrets:reveal"],
+      });
+
+      // Generate Org Recovery Keypair and split into 2 shares
+      const recPair = await generateOrgRecoveryKeyPair();
+      orgRecoveryPubKey = recPair.publicKey;
+      const shares = splitRecoveryKey(recPair.privateKeyBytes);
+      recoveryShare1 = shares.share1;
+      recoveryShare2 = shares.share2;
+    });
+
+    afterAll(async () => {
+      await slice4App.close();
+    });
+
+    it("enforces human-only admin separation and rejects agent callers with HTTP 403", async () => {
+      // Create agent token
+      const agToken = "agt_slice4_agent_01.secret_12345";
+      const agHash = crypto.createHash("sha256").update(agToken).digest("hex");
+      slice4Db.db
+        .insert(sqliteSchema.agents)
+        .values({
+          id: "agt_slice4_agent_01",
+          tenantId: slice4TenantId,
+          vaultId: "vlt_slice4_agent_vault_01",
+          name: "Test Agent",
+          vaultRole: "SecretConsumer",
+          scopesJson: JSON.stringify(["secrets:read"]),
+          keyVersion: 1,
+          agentEncryptedVaultKey: "placeholder",
+          iv: "placeholder_iv_12",
+          authTag: "placeholder_tag_16",
+          aad: "placeholder_aad",
+          tokenHash: agHash,
+          status: "active",
+          createdByUserId: "usr_superadmin_01",
+          createdAt: new Date().toISOString(),
+        })
+        .run();
+
+      const res = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/admin/users",
+        headers: { authorization: `Bearer ${agToken}` },
+        payload: {
+          email: "agent_created@enterprise.local",
+          displayName: "Malicious Provisioning",
+        },
+      });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toContain("restricted to human administrators");
+    });
+
+    it("enforces system role RBAC matrices across UserAdmin, SecurityAdmin, and ComplianceAuditor", async () => {
+      // UserAdmin can manage users
+      const listUsersRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/users",
+        headers: { authorization: `Bearer ${userAdminToken}` },
+      });
+      expect(listUsersRes.statusCode).toBe(200);
+
+      // UserAdmin CANNOT access IdP or SIEM config
+      const idpRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/idp",
+        headers: { authorization: `Bearer ${userAdminToken}` },
+      });
+      expect(idpRes.statusCode).toBe(403);
+
+      // SecurityAdmin CANNOT manage users
+      const secUsersRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/users",
+        headers: { authorization: `Bearer ${secAdminToken}` },
+      });
+      expect(secUsersRes.statusCode).toBe(403);
+
+      // SecurityAdmin CAN manage roles and SIEM config
+      const rolesRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/roles",
+        headers: { authorization: `Bearer ${secAdminToken}` },
+      });
+      expect(rolesRes.statusCode).toBe(200);
+
+      // SecurityAdmin CAN configure SIEM
+      const siemRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/admin/siem",
+        headers: { authorization: `Bearer ${secAdminToken}` },
+        payload: {
+          webhookUrl: "https://siem.enterprise.local/webhook",
+          sharedSecret: "super-secret-siem-token-12345",
+          enabled: true,
+        },
+      });
+      expect(siemRes.statusCode).toBe(200);
+
+      // ComplianceAuditor can read audit logs and verify
+      const auditRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/audit-logs",
+        headers: { authorization: `Bearer ${auditorToken}` },
+      });
+      expect(auditRes.statusCode).toBe(200);
+
+      const verifyRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/audit-logs/verify",
+        headers: { authorization: `Bearer ${auditorToken}` },
+      });
+      expect(verifyRes.statusCode).toBe(200);
+      expect(verifyRes.json().valid).toBe(true);
+
+      // ComplianceAuditor CANNOT update IdP or users
+      const auditorIdpRes = await slice4App.inject({
+        method: "PUT",
+        url: "/api/v1/admin/idp",
+        headers: { authorization: `Bearer ${auditorToken}` },
+        payload: { providerType: "oidc", issuer: "https://evil.local" },
+      });
+      expect(auditorIdpRes.statusCode).toBe(403);
+    });
+
+    it("cryptographically withholds EncryptedVaultKey and payload for SecretReader role", async () => {
+      // 1. Create a vault with OrgRecoveryEncryptedVaultKey
+      const vaultKey = generateVaultKeyBytes();
+      slice4VaultId = generateEntityId("vlt_");
+      const recoveryBlob = await wrapVaultKeyWithOrgRecoveryKey(
+        vaultKey,
+        orgRecoveryPubKey,
+        slice4VaultId,
+        1,
+      );
+
+      const createVaultRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          id: slice4VaultId,
+          name: "Escrowed Production Vault",
+          description: "Dual-control recovery vault",
+          encryptedVaultKey: {
+            ciphertext: "admin_key_cipher",
+            iv: "admin_iv_123456",
+            authTag: "admin_tag_12345678",
+            aad: `vault-share:${slice4VaultId}:1`,
+            keyVersion: 1,
+          },
+          orgRecoveryEncryptedVaultKey: recoveryBlob,
+        },
+      });
+      expect(createVaultRes.statusCode).toBe(201);
+      const actualVaultId = createVaultRes.json().id;
+
+      // 2. Share vault with user as SecretReader
+      const uList = slice4Db.db
+        .select()
+        .from(sqliteSchema.users)
+        .where(eq(sqliteSchema.users.email, "reader@enterprise.local"))
+        .all();
+      const readerUserId = uList[0]!.id;
+
+      const shareRes = await slice4App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${actualVaultId}/members`,
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          userId: readerUserId,
+          vaultRole: "SecretReader",
+        },
+      });
+      expect(shareRes.statusCode).toBe(201);
+
+      // 3. GET /api/v1/vaults/:id as SecretReader returns encryptedVaultKey: null
+      const getVaultRes = await slice4App.inject({
+        method: "GET",
+        url: `/api/v1/vaults/${actualVaultId}`,
+        headers: { authorization: `Bearer ${readerToken}` },
+      });
+      expect(getVaultRes.statusCode).toBe(200);
+      expect(getVaultRes.json().encryptedVaultKey).toBeNull();
+
+      // 4. Create secret in the vault
+      const secId = generateEntityId("sec_");
+      const createSecRes = await slice4App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${actualVaultId}/secrets`,
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          id: secId,
+          vaultId: actualVaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            algorithm: "AES-256-GCM",
+            ciphertext: "metadata_cipher",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: `${slice4TenantId}:${actualVaultId}:${secId}:1:1`,
+            keyVersion: 1,
+          },
+          encryptedPayload: {
+            algorithm: "AES-256-GCM",
+            ciphertext: "payload_cipher",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: `${slice4TenantId}:${actualVaultId}:${secId}:1:1`,
+            keyVersion: 1,
+          },
+        },
+      });
+      expect(createSecRes.statusCode).toBe(201);
+
+      // 5. POST /api/v1/secrets/:id/reveal as SecretReader returns 403 Forbidden
+      const revealRes = await slice4App.inject({
+        method: "POST",
+        url: `/api/v1/secrets/${secId}/reveal`,
+        headers: { authorization: `Bearer ${readerToken}` },
+      });
+      expect(revealRes.statusCode).toBe(403);
+      expect(revealRes.json().error).toContain("SecretReader");
+    });
+
+    it("executes dual-control organization recovery escrow with quorum validation", async () => {
+      // 1. SuperAdmin creates a vault with OrgRecoveryEncryptedVaultKey
+      const vaultKey = generateVaultKeyBytes();
+      const escrowVaultId = generateEntityId("vlt_");
+      const recoveryBlob = await wrapVaultKeyWithOrgRecoveryKey(
+        vaultKey,
+        orgRecoveryPubKey,
+        escrowVaultId,
+        1,
+      );
+
+      const createVaultRes = await slice4App.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          id: escrowVaultId,
+          name: "Quorum Recovery Vault",
+          description: "Dual-control recovery quorum test",
+          encryptedVaultKey: {
+            ciphertext: "admin_key_cipher",
+            iv: "admin_iv_123456",
+            authTag: "admin_tag_12345678",
+            aad: `vault-share:${escrowVaultId}:1`,
+            keyVersion: 1,
+          },
+          orgRecoveryEncryptedVaultKey: recoveryBlob,
+        },
+      });
+      expect(createVaultRes.statusCode).toBe(201);
+      const actualVaultId = createVaultRes.json().id;
+
+      // 2. SuperAdmin initiates recovery with Share 1
+      const initRes = await slice4App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${actualVaultId}/recovery/initiate`,
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          vaultId: actualVaultId,
+          reason: "Employee offboarding recovery request",
+          initiatorShare: recoveryShare1,
+        },
+      });
+      expect(initRes.statusCode).toBe(201);
+      const { recoveryId } = initRes.json();
+      expect(recoveryId).toMatch(/^rec_/);
+
+      // 3. SuperAdmin attempting to self-approve fails with 403 Forbidden (quorum violation)
+      const selfApproveRes = await slice4App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${actualVaultId}/recovery/approve`,
+        headers: { authorization: `Bearer ${superAdminToken}` },
+        payload: {
+          recoveryId,
+          approverShare: recoveryShare2,
+        },
+      });
+      expect(selfApproveRes.statusCode).toBe(403);
+      expect(selfApproveRes.json().error).toContain("Dual-control quorum violation");
+
+      // 4. SecurityAdmin approves with Share 2 -> Successful unescrow
+      const approveRes = await slice4App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${actualVaultId}/recovery/approve`,
+        headers: { authorization: `Bearer ${secAdminToken}` },
+        payload: {
+          recoveryId,
+          approverShare: recoveryShare2,
+        },
+      });
+      expect(approveRes.statusCode).toBe(200);
+      expect(approveRes.json().status).toBe("completed");
+      expect(approveRes.json().recovered).toBe(true);
+    });
+
+    it("verifies hash-chained audit plane and detects tampered records", async () => {
+      // 1. Verify valid hash chain
+      const verifyRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/audit-logs/verify",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+      });
+      expect(verifyRes.statusCode).toBe(200);
+      const verifyJson = verifyRes.json();
+      expect(verifyJson.valid).toBe(true);
+      expect(verifyJson.totalEvents).toBeGreaterThan(0);
+
+      // 2. Tamper with an audit record in the database
+      const records = slice4Db.db.select().from(sqliteSchema.auditLogs).all();
+      expect(records.length).toBeGreaterThan(0);
+      const targetRecord = records[records.length - 1]!;
+      slice4Db.db
+        .update(sqliteSchema.auditLogs)
+        .set({ canonicalEventJson: JSON.stringify({ tampered: true }) })
+        .where(eq(sqliteSchema.auditLogs.id, targetRecord.id))
+        .run();
+
+      // 3. Verify hash chain now detects tampering
+      const tamperedVerifyRes = await slice4App.inject({
+        method: "GET",
+        url: "/api/v1/admin/audit-logs/verify",
+        headers: { authorization: `Bearer ${superAdminToken}` },
+      });
+      expect(tamperedVerifyRes.statusCode).toBe(200);
+      const tamperedJson = tamperedVerifyRes.json();
+      expect(tamperedJson.valid).toBe(false);
+      expect(tamperedJson.reason).toContain("Hash mismatch");
     });
   });
 });

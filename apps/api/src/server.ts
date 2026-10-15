@@ -5,17 +5,30 @@ import rateLimit from "@fastify/rate-limit";
 import { and, desc, eq } from "drizzle-orm";
 import { generateEntityId } from "@llm-vault/ids";
 import {
-  isMcpAllowedScope,
+  AdminCreateUserRequestSchema,
+  AdminSiemConfigRequestSchema,
+  AdminUpdateIdpRequestSchema,
+  AdminUpdateUserRequestSchema,
+  ApproveRecoveryRequestSchema,
+  InitiateRecoveryRequestSchema,
+  SYSTEM_ROLES,
+  SYSTEM_ROLE_PERMISSIONS,
+  VAULT_ROLES,
   VAULT_ROLE_PERMISSIONS,
+  isMcpAllowedScope,
   type PermissionScope,
+  type SystemRole,
   type VaultRole,
 } from "@llm-vault/schema";
 import {
   agents,
   auditLogs,
+  idpConfigs,
+  recoveryRequests,
   secrets,
   secretTagIndexes,
   secretVersions,
+  siemConfigs,
   tenants,
   users,
   vaultMemberKeys,
@@ -34,7 +47,13 @@ import {
   type AuthenticatedCaller,
   type OidcClaims,
 } from "./auth.js";
-import { verifyTotpCode } from "@llm-vault/crypto";
+import {
+  combineRecoveryKey,
+  unwrapVaultKeyWithOrgRecoveryKey,
+  verifyTotpCode,
+  zeroizeBuffer,
+  type OrgRecoveryWrappedVaultKey,
+} from "@llm-vault/crypto";
 import { createDatabase, type VaultDatabase } from "./db.js";
 
 declare module "fastify" {
@@ -104,6 +123,29 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     }
   };
 
+  const requireHumanAdmin = (caller: AuthenticatedCaller, reply: FastifyReply) => {
+    if (caller.actorType !== "user") {
+      reply.status(403).send({
+        error:
+          "Forbidden: Administrative mutation endpoints are restricted to human administrators.",
+      });
+      throw new Error("Forbidden");
+    }
+  };
+
+  const requireSystemRole = (
+    caller: AuthenticatedCaller,
+    allowedRoles: SystemRole[],
+    reply: FastifyReply,
+  ) => {
+    if (!caller.systemRole || !allowedRoles.includes(caller.systemRole as SystemRole)) {
+      reply.status(403).send({
+        error: `Forbidden: Caller requires one of the following system roles: ${allowedRoles.join(", ")}`,
+      });
+      throw new Error("Forbidden");
+    }
+  };
+
   // Helper to append audit logs
   const recordAudit = (
     tenantId: string,
@@ -162,6 +204,43 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         timestamp,
       })
       .run();
+
+    if (deploymentMode === "enterprise") {
+      void (async () => {
+        try {
+          const siemList = database.db
+            .select()
+            .from(siemConfigs)
+            .where(eq(siemConfigs.tenantId, tenantId))
+            .all();
+          const siem = siemList[0];
+          const webhookUrl =
+            siem && siem.enabled ? siem.webhookUrl : process.env["SIEM_WEBHOOK_URL"];
+          const sharedSecret =
+            siem?.sharedSecret ?? process.env["SIEM_WEBHOOK_SECRET"] ?? "default-secret";
+          if (webhookUrl) {
+            const hmac = crypto
+              .createHmac("sha256", sharedSecret)
+              .update(canonicalJson)
+              .digest("hex");
+            await fetch(webhookUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-Llm-Vault-Event-Id": auditId,
+                "X-Llm-Vault-Timestamp": timestamp,
+                "X-Llm-Vault-Signature": hmac,
+              },
+              body: canonicalJson,
+            }).catch(() => {
+              // Non-blocking SIEM delivery failure tolerance
+            });
+          }
+        } catch {
+          // Non-blocking
+        }
+      })();
+    }
 
     return auditId;
   };
@@ -382,6 +461,8 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       return reply.status(401).send({ error: "Invalid credentials." });
     }
 
+    const userSysRole = (user.systemRole ?? "SecretConsumer") as SystemRole;
+    const systemScopes = (SYSTEM_ROLE_PERMISSIONS[userSysRole] ?? []) as string[];
     const caller: AuthenticatedCaller = {
       actorId: user.id,
       actorType: "user",
@@ -389,7 +470,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       email: user.email,
       displayName: user.displayName,
       systemRole: user.systemRole,
-      scopes: Object.values(VAULT_ROLE_PERMISSIONS.WorkspaceOwner),
+      scopes: systemScopes,
     };
 
     const token = issueSessionToken(caller);
@@ -505,6 +586,8 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       user = database.db.select().from(users).where(eq(users.id, userId)).all()[0]!;
     }
 
+    const userSysRole = (user.systemRole ?? "SecretConsumer") as SystemRole;
+    const systemScopes = (SYSTEM_ROLE_PERMISSIONS[userSysRole] ?? []) as string[];
     const caller: AuthenticatedCaller = {
       actorId: user.id,
       actorType: "user",
@@ -512,7 +595,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       email: user.email,
       displayName: user.displayName,
       systemRole: user.systemRole,
-      scopes: Object.values(VAULT_ROLE_PERMISSIONS.SecretConsumer),
+      scopes: systemScopes,
     };
 
     const token = issueSessionToken(caller);
@@ -600,6 +683,8 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       user = database.db.select().from(users).where(eq(users.id, userId)).all()[0]!;
     }
 
+    const userSysRole = (user.systemRole ?? "SecretConsumer") as SystemRole;
+    const systemScopes = (SYSTEM_ROLE_PERMISSIONS[userSysRole] ?? []) as string[];
     const caller: AuthenticatedCaller = {
       actorId: user.id,
       actorType: "user",
@@ -607,7 +692,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       email: user.email,
       displayName: user.displayName,
       systemRole: user.systemRole,
-      scopes: Object.values(VAULT_ROLE_PERMISSIONS.SecretConsumer),
+      scopes: systemScopes,
     };
 
     const token = issueSessionToken(caller);
@@ -678,7 +763,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       email: user.email,
       displayName: user.displayName,
       systemRole: "SuperAdmin",
-      scopes: Object.values(VAULT_ROLE_PERMISSIONS.WorkspaceOwner),
+      scopes: [...SYSTEM_ROLE_PERMISSIONS.SuperAdmin],
     };
 
     const token = issueSessionToken(caller);
@@ -733,9 +818,18 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         .send({ error: "Vault name and encryptedVaultKey envelope required." });
     }
 
-    const vaultId = generateEntityId("vlt_");
+    const vaultId = (body as { id?: string }).id ?? generateEntityId("vlt_");
     const now = new Date().toISOString();
     const keyVersion = body.encryptedVaultKey.keyVersion ?? 1;
+
+    const rawRecoveryKey = (body as { orgRecoveryEncryptedVaultKey?: unknown })
+      .orgRecoveryEncryptedVaultKey;
+    const orgRecoveryEncryptedVaultKey =
+      typeof rawRecoveryKey === "object" && rawRecoveryKey !== null
+        ? JSON.stringify(rawRecoveryKey)
+        : typeof rawRecoveryKey === "string"
+          ? rawRecoveryKey
+          : undefined;
 
     database.db
       .insert(vaults)
@@ -745,6 +839,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         name: body.name.trim(),
         description: body.description?.trim() ?? "",
         keyVersion,
+        orgRecoveryEncryptedVaultKey,
         createdByUserId: caller.actorId,
         createdAt: now,
         updatedAt: now,
@@ -889,13 +984,17 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         .all();
       const mem = memList[0];
       if (mem) {
-        wrappedKeyEnvelope = {
-          ciphertext: mem.encryptedVaultKey,
-          iv: mem.iv,
-          authTag: mem.authTag,
-          aad: mem.aad,
-          keyVersion: mem.keyVersion,
-        };
+        if (mem.vaultRole === "SecretReader" || !mem.encryptedVaultKey) {
+          wrappedKeyEnvelope = null;
+        } else {
+          wrappedKeyEnvelope = {
+            ciphertext: mem.encryptedVaultKey,
+            iv: mem.iv,
+            authTag: mem.authTag,
+            aad: mem.aad,
+            keyVersion: mem.keyVersion,
+          };
+        }
       }
     }
 
@@ -925,7 +1024,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     const body = request.body as {
       userId: string;
       vaultRole: VaultRole;
-      encryptedVaultKey: {
+      encryptedVaultKey?: {
         ciphertext: string;
         iv: string;
         authTag: string;
@@ -934,10 +1033,11 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       };
     };
 
-    if (!body.userId || !body.vaultRole || !body.encryptedVaultKey) {
-      return reply
-        .status(400)
-        .send({ error: "userId, vaultRole, and encryptedVaultKey are required." });
+    const isSecretReader = body.vaultRole === "SecretReader";
+    if (!body.userId || !body.vaultRole || (!isSecretReader && !body.encryptedVaultKey)) {
+      return reply.status(400).send({
+        error: "userId, vaultRole, and encryptedVaultKey are required (unless SecretReader).",
+      });
     }
 
     const vaultList = database.db.select().from(vaults).where(eq(vaults.id, vaultId)).all();
@@ -959,6 +1059,14 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       .where(and(eq(vaultMemberKeys.vaultId, vaultId), eq(vaultMemberKeys.userId, body.userId)))
       .all();
 
+    const keyVersion = isSecretReader
+      ? (vault.keyVersion ?? 1)
+      : body.encryptedVaultKey!.keyVersion;
+    const encKey = isSecretReader ? null : body.encryptedVaultKey!.ciphertext;
+    const iv = isSecretReader ? null : body.encryptedVaultKey!.iv;
+    const authTag = isSecretReader ? null : body.encryptedVaultKey!.authTag;
+    const aad = isSecretReader ? null : body.encryptedVaultKey!.aad;
+
     let memberKeyId: string;
     if (existing.length > 0 && existing[0]?.id) {
       memberKeyId = existing[0].id;
@@ -966,11 +1074,11 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         .update(vaultMemberKeys)
         .set({
           vaultRole: body.vaultRole,
-          keyVersion: body.encryptedVaultKey.keyVersion,
-          encryptedVaultKey: body.encryptedVaultKey.ciphertext,
-          iv: body.encryptedVaultKey.iv,
-          authTag: body.encryptedVaultKey.authTag,
-          aad: body.encryptedVaultKey.aad,
+          keyVersion,
+          encryptedVaultKey: encKey,
+          iv,
+          authTag,
+          aad,
           grantedByUserId: caller.actorId,
           revokedAt: null,
         })
@@ -986,11 +1094,11 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
           vaultId,
           userId: body.userId,
           vaultRole: body.vaultRole,
-          keyVersion: body.encryptedVaultKey.keyVersion,
-          encryptedVaultKey: body.encryptedVaultKey.ciphertext,
-          iv: body.encryptedVaultKey.iv,
-          authTag: body.encryptedVaultKey.authTag,
-          aad: body.encryptedVaultKey.aad,
+          keyVersion,
+          encryptedVaultKey: encKey,
+          iv,
+          authTag,
+          aad,
           grantedByUserId: caller.actorId,
           createdAt: now,
           revokedAt: null,
@@ -1006,7 +1114,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       "vaults:share",
       body.userId,
       request.ip,
-      { vaultRole: body.vaultRole, keyVersion: body.encryptedVaultKey.keyVersion },
+      { vaultRole: body.vaultRole, keyVersion },
     );
 
     return reply.status(201).send({
@@ -1014,7 +1122,7 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       vaultId,
       userId: body.userId,
       vaultRole: body.vaultRole,
-      keyVersion: body.encryptedVaultKey.keyVersion,
+      keyVersion,
     });
   });
 
@@ -1521,6 +1629,11 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     if (caller.actorType === "agent") {
       const agList = database.db.select().from(agents).where(eq(agents.id, caller.actorId)).all();
       const ag = agList[0];
+      if (ag?.vaultRole === "SecretReader") {
+        return reply
+          .status(403)
+          .send({ error: "Forbidden: SecretReader role cannot reveal secrets." });
+      }
       if (ag && ag.vaultId === secret.vaultId) {
         callerVaultKeyEnvelope = {
           ciphertext: ag.agentEncryptedVaultKey,
@@ -1542,7 +1655,12 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         )
         .all();
       const mem = memList[0];
-      if (mem) {
+      if (mem?.vaultRole === "SecretReader") {
+        return reply
+          .status(403)
+          .send({ error: "Forbidden: SecretReader role cannot reveal secrets." });
+      }
+      if (mem && mem.encryptedVaultKey) {
         callerVaultKeyEnvelope = {
           ciphertext: mem.encryptedVaultKey,
           iv: mem.iv,
@@ -1884,6 +2002,665 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       .all();
 
     return reply.send({ logs });
+  });
+
+  // -------------------------------------------------------------------------
+  // Human-Only Admin Management Routes (Section 5 & 6)
+  // -------------------------------------------------------------------------
+
+  // GET /api/v1/admin/users
+  app.get("/api/v1/admin/users", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireScope(caller, "admin:users:manage", reply);
+
+    const userList =
+      caller.systemRole === "SuperAdmin"
+        ? database.db.select().from(users).all()
+        : database.db.select().from(users).where(eq(users.tenantId, caller.tenantId)).all();
+
+    const safeUsers = userList.map((u) => ({
+      id: u.id,
+      tenantId: u.tenantId,
+      email: u.email,
+      displayName: u.displayName,
+      systemRole: u.systemRole,
+      status: u.status,
+      isBreakGlassAdmin: Boolean(u.isBreakGlassAdmin),
+      createdAt: u.createdAt,
+      updatedAt: u.updatedAt,
+    }));
+
+    return reply.send({ users: safeUsers });
+  });
+
+  // POST /api/v1/admin/users
+  app.post("/api/v1/admin/users", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireScope(caller, "admin:users:manage", reply);
+
+    const body = AdminCreateUserRequestSchema.parse(request.body);
+    const existing = database.db
+      .select()
+      .from(users)
+      .where(
+        and(eq(users.tenantId, caller.tenantId), eq(users.email, body.email.toLowerCase().trim())),
+      )
+      .all();
+    if (existing.length > 0) {
+      return reply.status(409).send({ error: `User with email ${body.email} already exists.` });
+    }
+
+    const userId = generateEntityId("usr_");
+    const now = new Date().toISOString();
+    const salt = crypto.randomBytes(32).toString("hex");
+    const placeholderKey = crypto.randomBytes(32).toString("base64");
+
+    database.db
+      .insert(users)
+      .values({
+        id: userId,
+        tenantId: caller.tenantId,
+        email: body.email.toLowerCase().trim(),
+        displayName: body.displayName.trim(),
+        systemRole: body.systemRole ?? "SecretConsumer",
+        kdfAlgorithm: "PBKDF2-HMAC-SHA256",
+        kdfSalt: salt,
+        kdfIterations: 600000,
+        x25519PublicKey: placeholderKey,
+        ed25519PublicKey: placeholderKey,
+        publicKeyFingerprint: crypto.createHash("sha256").update(placeholderKey).digest("hex"),
+        encryptedX25519PrivateKey: placeholderKey,
+        encryptedEd25519PrivateKey: placeholderKey,
+        status: body.status ?? "active",
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      null,
+      caller.actorId,
+      caller.actorType,
+      "admin:users:manage",
+      userId,
+      request.ip,
+      { action: "create_user", email: body.email },
+    );
+
+    return reply.status(201).send({
+      id: userId,
+      tenantId: caller.tenantId,
+      email: body.email.toLowerCase().trim(),
+      displayName: body.displayName.trim(),
+      systemRole: body.systemRole ?? "SecretConsumer",
+      status: body.status ?? "active",
+      createdAt: now,
+    });
+  });
+
+  // PUT /api/v1/admin/users/:id
+  app.put("/api/v1/admin/users/:id", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    const { id } = request.params as { id: string };
+
+    const body = AdminUpdateUserRequestSchema.parse(request.body);
+    if (body.systemRole) {
+      requireScope(caller, "admin:roles:manage", reply);
+    } else {
+      requireScope(caller, "admin:users:manage", reply);
+    }
+
+    const targetUser = database.db.select().from(users).where(eq(users.id, id)).all()[0];
+    if (!targetUser) {
+      return reply.status(404).send({ error: `User ${id} not found.` });
+    }
+
+    const now = new Date().toISOString();
+    const updateValues: Record<string, unknown> = { updatedAt: now };
+    if (body.displayName) updateValues["displayName"] = body.displayName.trim();
+    if (body.status) updateValues["status"] = body.status;
+    if (body.systemRole) updateValues["systemRole"] = body.systemRole;
+
+    database.db.update(users).set(updateValues).where(eq(users.id, id)).run();
+
+    recordAudit(
+      caller.tenantId,
+      null,
+      caller.actorId,
+      caller.actorType,
+      "admin:users:manage",
+      id,
+      request.ip,
+      { action: "update_user", updates: body },
+    );
+
+    return reply.send({
+      id,
+      displayName: body.displayName ?? targetUser.displayName,
+      status: body.status ?? targetUser.status,
+      systemRole: body.systemRole ?? targetUser.systemRole,
+      updatedAt: now,
+    });
+  });
+
+  // DELETE /api/v1/admin/users/:id
+  app.delete("/api/v1/admin/users/:id", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireScope(caller, "admin:users:manage", reply);
+    const { id } = request.params as { id: string };
+
+    const targetUser = database.db.select().from(users).where(eq(users.id, id)).all()[0];
+    if (!targetUser) {
+      return reply.status(404).send({ error: `User ${id} not found.` });
+    }
+
+    const now = new Date().toISOString();
+    database.db
+      .update(users)
+      .set({ status: "suspended", updatedAt: now })
+      .where(eq(users.id, id))
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      null,
+      caller.actorId,
+      caller.actorType,
+      "admin:users:manage",
+      id,
+      request.ip,
+      { action: "suspend_user" },
+    );
+
+    return reply.send({ success: true, userId: id, status: "suspended" });
+  });
+
+  // GET /api/v1/admin/roles
+  app.get("/api/v1/admin/roles", async (request, reply) => {
+    requireAuth(request, reply);
+    return reply.send({
+      systemRoles: SYSTEM_ROLES,
+      systemRolePermissions: SYSTEM_ROLE_PERMISSIONS,
+      vaultRoles: VAULT_ROLES,
+      vaultRolePermissions: VAULT_ROLE_PERMISSIONS,
+    });
+  });
+
+  // PUT /api/v1/admin/users/:id/role
+  app.put("/api/v1/admin/users/:id/role", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireScope(caller, "admin:roles:manage", reply);
+    const { id } = request.params as { id: string };
+    const body = request.body as { systemRole: SystemRole };
+
+    if (!body.systemRole || !SYSTEM_ROLES.includes(body.systemRole)) {
+      return reply.status(400).send({ error: "Valid systemRole is required." });
+    }
+
+    const targetUser = database.db.select().from(users).where(eq(users.id, id)).all()[0];
+    if (!targetUser) {
+      return reply.status(404).send({ error: `User ${id} not found.` });
+    }
+
+    const now = new Date().toISOString();
+    database.db
+      .update(users)
+      .set({ systemRole: body.systemRole, updatedAt: now })
+      .where(eq(users.id, id))
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      null,
+      caller.actorId,
+      caller.actorType,
+      "admin:roles:manage",
+      id,
+      request.ip,
+      { action: "update_user_role", systemRole: body.systemRole },
+    );
+
+    return reply.send({ userId: id, systemRole: body.systemRole });
+  });
+
+  // GET /api/v1/admin/idp
+  app.get("/api/v1/admin/idp", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireScope(caller, "admin:idp:manage", reply);
+
+    const config = database.db
+      .select()
+      .from(idpConfigs)
+      .where(eq(idpConfigs.tenantId, caller.tenantId))
+      .all()[0];
+
+    return reply.send({ idpConfig: config ?? null });
+  });
+
+  // PUT /api/v1/admin/idp
+  app.put("/api/v1/admin/idp", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireScope(caller, "admin:idp:manage", reply);
+
+    const body = AdminUpdateIdpRequestSchema.parse(request.body);
+    const now = new Date().toISOString();
+    const existing = database.db
+      .select()
+      .from(idpConfigs)
+      .where(eq(idpConfigs.tenantId, caller.tenantId))
+      .all()[0];
+
+    if (existing) {
+      database.db
+        .update(idpConfigs)
+        .set({
+          providerType: body.providerType,
+          issuer: body.issuer,
+          clientId: body.clientId,
+          clientSecret: body.clientSecret,
+          authorizationEndpoint: body.authorizationEndpoint,
+          tokenEndpoint: body.tokenEndpoint,
+          ssoUrl: body.ssoUrl,
+          certificate: body.certificate,
+          enabled: body.enabled,
+          updatedAt: now,
+        })
+        .where(eq(idpConfigs.id, existing.id))
+        .run();
+    } else {
+      const configId = `idp_${crypto.randomBytes(12).toString("hex")}`;
+      database.db
+        .insert(idpConfigs)
+        .values({
+          id: configId,
+          tenantId: caller.tenantId,
+          providerType: body.providerType,
+          issuer: body.issuer,
+          clientId: body.clientId,
+          clientSecret: body.clientSecret,
+          authorizationEndpoint: body.authorizationEndpoint,
+          tokenEndpoint: body.tokenEndpoint,
+          ssoUrl: body.ssoUrl,
+          certificate: body.certificate,
+          enabled: body.enabled,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+    }
+
+    recordAudit(
+      caller.tenantId,
+      null,
+      caller.actorId,
+      caller.actorType,
+      "admin:idp:manage",
+      caller.tenantId,
+      request.ip,
+      { action: "update_idp_config", providerType: body.providerType },
+    );
+
+    return reply.send({ success: true, providerType: body.providerType, issuer: body.issuer });
+  });
+
+  // GET /api/v1/admin/siem
+  app.get("/api/v1/admin/siem", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireSystemRole(caller, ["SuperAdmin", "SecurityAdmin"], reply);
+
+    const config = database.db
+      .select()
+      .from(siemConfigs)
+      .where(eq(siemConfigs.tenantId, caller.tenantId))
+      .all()[0];
+
+    return reply.send({
+      siemConfig: config
+        ? {
+            id: config.id,
+            webhookUrl: config.webhookUrl,
+            enabled: Boolean(config.enabled),
+            sharedSecretMasked: "********",
+            createdAt: config.createdAt,
+            updatedAt: config.updatedAt,
+          }
+        : null,
+    });
+  });
+
+  // POST /api/v1/admin/siem
+  app.post("/api/v1/admin/siem", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireSystemRole(caller, ["SuperAdmin", "SecurityAdmin"], reply);
+
+    const body = AdminSiemConfigRequestSchema.parse(request.body);
+    const now = new Date().toISOString();
+    const existing = database.db
+      .select()
+      .from(siemConfigs)
+      .where(eq(siemConfigs.tenantId, caller.tenantId))
+      .all()[0];
+
+    if (existing) {
+      database.db
+        .update(siemConfigs)
+        .set({
+          webhookUrl: body.webhookUrl,
+          sharedSecret: body.sharedSecret,
+          enabled: body.enabled,
+          updatedAt: now,
+        })
+        .where(eq(siemConfigs.id, existing.id))
+        .run();
+    } else {
+      const configId = `siem_${crypto.randomBytes(12).toString("hex")}`;
+      database.db
+        .insert(siemConfigs)
+        .values({
+          id: configId,
+          tenantId: caller.tenantId,
+          webhookUrl: body.webhookUrl,
+          sharedSecret: body.sharedSecret,
+          enabled: body.enabled,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+    }
+
+    recordAudit(
+      caller.tenantId,
+      null,
+      caller.actorId,
+      caller.actorType,
+      "admin:roles:manage",
+      caller.tenantId,
+      request.ip,
+      { action: "update_siem_config", webhookUrl: body.webhookUrl },
+    );
+
+    return reply.send({ success: true, webhookUrl: body.webhookUrl, enabled: body.enabled });
+  });
+
+  // GET /api/v1/admin/audit-logs
+  app.get("/api/v1/admin/audit-logs", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    if (
+      caller.systemRole !== "SuperAdmin" &&
+      caller.systemRole !== "SecurityAdmin" &&
+      caller.systemRole !== "ComplianceAuditor" &&
+      !caller.scopes.includes("admin:audit:read")
+    ) {
+      return reply.status(403).send({ error: 'Forbidden: Missing "admin:audit:read" scope' });
+    }
+
+    const logs = database.db
+      .select()
+      .from(auditLogs)
+      .where(eq(auditLogs.tenantId, caller.tenantId))
+      .orderBy(desc(auditLogs.timestamp))
+      .limit(100)
+      .all();
+
+    return reply.send({ logs });
+  });
+
+  // GET & POST /api/v1/admin/audit-logs/verify
+  const handleVerifyAuditLogs = async (request: FastifyRequest, reply: FastifyReply) => {
+    const caller = requireAuth(request, reply);
+    if (
+      caller.systemRole !== "SuperAdmin" &&
+      caller.systemRole !== "SecurityAdmin" &&
+      caller.systemRole !== "ComplianceAuditor" &&
+      !caller.scopes.includes("admin:audit:read")
+    ) {
+      return reply.status(403).send({ error: 'Forbidden: Missing "admin:audit:read" scope' });
+    }
+
+    const tenantId = caller.tenantId;
+    const records = database.db
+      .select()
+      .from(auditLogs)
+      .where(eq(auditLogs.tenantId, tenantId))
+      .orderBy(auditLogs.timestamp)
+      .all();
+
+    if (records.length === 0) {
+      return reply.send({
+        valid: true,
+        totalEvents: 0,
+        genesisHash: "GENESIS_0000000000000000000000000000000000000000000000000000000000000000",
+        latestHash: "GENESIS_0000000000000000000000000000000000000000000000000000000000000000",
+      });
+    }
+
+    let expectedPrevHash =
+      "GENESIS_0000000000000000000000000000000000000000000000000000000000000000";
+    for (const record of records) {
+      if (record.prevEventHash !== expectedPrevHash) {
+        return reply.send({
+          valid: false,
+          totalEvents: records.length,
+          genesisHash: records[0]!.prevEventHash,
+          latestHash: record.eventHash,
+          failedEventId: record.id,
+          reason: `Broken hash chain: expected prev hash "${expectedPrevHash}", found "${record.prevEventHash}"`,
+        });
+      }
+      const calculatedHash = crypto
+        .createHash("sha256")
+        .update(`${record.prevEventHash}:${record.canonicalEventJson}`)
+        .digest("hex");
+      if (calculatedHash !== record.eventHash) {
+        return reply.send({
+          valid: false,
+          totalEvents: records.length,
+          genesisHash: records[0]!.prevEventHash,
+          latestHash: record.eventHash,
+          failedEventId: record.id,
+          reason: `Hash mismatch on event ${record.id}: expected "${calculatedHash}", found "${record.eventHash}"`,
+        });
+      }
+      expectedPrevHash = record.eventHash;
+    }
+
+    return reply.send({
+      valid: true,
+      totalEvents: records.length,
+      genesisHash: records[0]!.prevEventHash,
+      latestHash: records[records.length - 1]!.eventHash,
+    });
+  };
+
+  app.get("/api/v1/admin/audit-logs/verify", handleVerifyAuditLogs);
+  app.post("/api/v1/admin/audit-logs/verify", handleVerifyAuditLogs);
+
+  // -------------------------------------------------------------------------
+  // Dual-Control Organization Recovery Key Escrow (Section 1 & 6)
+  // -------------------------------------------------------------------------
+
+  // POST /api/v1/vaults/:vaultId/recovery/initiate
+  app.post("/api/v1/vaults/:vaultId/recovery/initiate", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireSystemRole(caller, ["SuperAdmin", "SecurityAdmin"], reply);
+
+    const { vaultId } = request.params as { vaultId: string };
+    const parsed = InitiateRecoveryRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: parsed.error.issues[0]?.message ?? "Invalid initiate recovery payload." });
+    }
+    const body = parsed.data;
+
+    const vault = database.db.select().from(vaults).where(eq(vaults.id, vaultId)).all()[0];
+    if (!vault || vault.tenantId !== caller.tenantId) {
+      return reply.status(404).send({ error: `Vault ${vaultId} not found.` });
+    }
+    if (!vault.orgRecoveryEncryptedVaultKey) {
+      return reply
+        .status(400)
+        .send({ error: "Vault does not have an escrowed OrgRecoveryEncryptedVaultKey." });
+    }
+
+    const recoveryId = `rec_${crypto.randomBytes(12).toString("hex")}`;
+    const now = new Date().toISOString();
+
+    database.db
+      .insert(recoveryRequests)
+      .values({
+        id: recoveryId,
+        tenantId: caller.tenantId,
+        vaultId,
+        initiatorUserId: caller.actorId,
+        initiatorSystemRole: caller.systemRole!,
+        initiatorShare: body.initiatorShare,
+        status: "pending",
+        reason: body.reason,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:export",
+      vaultId,
+      request.ip,
+      { severity: "HIGH", action: "recovery_initiate", recoveryId, reason: body.reason },
+    );
+
+    return reply.status(201).send({
+      recoveryId,
+      vaultId,
+      status: "pending",
+      message: "Recovery initiated. Counterpart admin quorum approval required.",
+    });
+  });
+
+  // POST /api/v1/vaults/:vaultId/recovery/approve
+  app.post("/api/v1/vaults/:vaultId/recovery/approve", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+    requireSystemRole(caller, ["SuperAdmin", "SecurityAdmin"], reply);
+
+    const { vaultId } = request.params as { vaultId: string };
+    const parsed = ApproveRecoveryRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: parsed.error.issues[0]?.message ?? "Invalid approve recovery payload." });
+    }
+    const body = parsed.data;
+
+    const recoveryReq = database.db
+      .select()
+      .from(recoveryRequests)
+      .where(and(eq(recoveryRequests.id, body.recoveryId), eq(recoveryRequests.vaultId, vaultId)))
+      .all()[0];
+
+    if (!recoveryReq) {
+      return reply.status(404).send({ error: `Recovery request ${body.recoveryId} not found.` });
+    }
+    if (recoveryReq.status !== "pending") {
+      return reply.status(400).send({
+        error: `Recovery request is not pending (status: ${recoveryReq.status}).`,
+      });
+    }
+
+    // Dual-control enforcement: Approver must be distinct human user from initiator
+    if (caller.actorId === recoveryReq.initiatorUserId) {
+      return reply.status(403).send({
+        error:
+          "Forbidden: Dual-control quorum violation. Approver cannot be the same administrator who initiated recovery.",
+      });
+    }
+
+    const vault = database.db.select().from(vaults).where(eq(vaults.id, vaultId)).all()[0];
+    if (!vault || !vault.orgRecoveryEncryptedVaultKey) {
+      return reply.status(404).send({ error: "Vault or escrowed recovery key not found." });
+    }
+
+    let recoveryKeyEnvelope: OrgRecoveryWrappedVaultKey;
+    try {
+      recoveryKeyEnvelope = JSON.parse(
+        vault.orgRecoveryEncryptedVaultKey,
+      ) as OrgRecoveryWrappedVaultKey;
+    } catch {
+      return reply.status(500).send({ error: "Failed to parse escrowed recovery key envelope." });
+    }
+
+    // Combine shares and unwrap VaultKey
+    let reconstructedKey: Uint8Array | null = null;
+    let recoveredVaultKey: Uint8Array | null = null;
+    try {
+      reconstructedKey = combineRecoveryKey(recoveryReq.initiatorShare, body.approverShare);
+      recoveredVaultKey = await unwrapVaultKeyWithOrgRecoveryKey(
+        recoveryKeyEnvelope,
+        reconstructedKey,
+        vaultId,
+      );
+    } catch (err: unknown) {
+      return reply.status(400).send({
+        error: `Recovery key unwrapping failed: ${err instanceof Error ? err.message : "Invalid key share."}`,
+      });
+    } finally {
+      // Immediate memory zeroization of reconstructed key material
+      if (reconstructedKey) zeroizeBuffer(reconstructedKey);
+      if (recoveredVaultKey) zeroizeBuffer(recoveredVaultKey);
+    }
+
+    const now = new Date().toISOString();
+    database.db
+      .update(recoveryRequests)
+      .set({
+        approverUserId: caller.actorId,
+        approverSystemRole: caller.systemRole,
+        approverShare: body.approverShare,
+        status: "completed",
+        updatedAt: now,
+      })
+      .where(eq(recoveryRequests.id, recoveryReq.id))
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "secrets:export",
+      vaultId,
+      request.ip,
+      {
+        severity: "CRITICAL",
+        action: "recovery_approved",
+        recoveryId: recoveryReq.id,
+        initiatorUserId: recoveryReq.initiatorUserId,
+        approverUserId: caller.actorId,
+      },
+    );
+
+    return reply.send({
+      status: "completed",
+      recoveryId: recoveryReq.id,
+      vaultId,
+      recovered: true,
+      message: "Dual-control quorum verified. VaultKey successfully unescrowed.",
+    });
   });
 
   return app;

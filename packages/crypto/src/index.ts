@@ -681,12 +681,26 @@ export async function unwrapUserPrivateKey(
   return new Uint8Array(decryptedBuffer);
 }
 
+const X25519_PKCS8_PREFIX = new Uint8Array([
+  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e, 0x04, 0x22, 0x04, 0x20,
+]);
+
 async function resolveX25519PrivateKey(key: CryptoKey | Uint8Array): Promise<CryptoKey> {
   if (key instanceof Uint8Array) {
-    return globalThis.crypto.subtle.importKey("pkcs8", toBuffer(key), { name: "X25519" }, false, [
-      "deriveBits",
-      "deriveKey",
-    ]);
+    let pkcs8Bytes = key;
+    if (key.byteLength === 32) {
+      const prefixed = new Uint8Array(48);
+      prefixed.set(X25519_PKCS8_PREFIX, 0);
+      prefixed.set(key, 16);
+      pkcs8Bytes = prefixed;
+    }
+    return globalThis.crypto.subtle.importKey(
+      "pkcs8",
+      toBuffer(pkcs8Bytes),
+      { name: "X25519" },
+      false,
+      ["deriveBits", "deriveKey"],
+    );
   }
   return key;
 }
@@ -809,6 +823,224 @@ export async function unwrapVaultKeyFromSender(
   const privKey = await resolveX25519PrivateKey(recipientX25519PrivateKey);
   const pubKey = await resolveX25519PublicKey(senderX25519PublicKey);
   const wrappingKey = await deriveSharedVaultWrappingKey(privKey, pubKey, vaultId, keyVersion);
+
+  const iv = base64ToBytes(wrappedRecord.iv);
+  const ciphertext = base64ToBytes(wrappedRecord.encryptedVaultKey);
+  const authTag = base64ToBytes(wrappedRecord.authTag);
+  const combined = new Uint8Array(ciphertext.byteLength + authTag.byteLength);
+  combined.set(ciphertext, 0);
+  combined.set(authTag, ciphertext.byteLength);
+
+  const decryptedBuffer = await globalThis.crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: toBuffer(iv),
+      additionalData: toBuffer(textEncoder.encode(expectedAad)),
+      tagLength: AES_GCM_TAG_BITS,
+    },
+    wrappingKey,
+    toBuffer(combined),
+  );
+
+  return new Uint8Array(decryptedBuffer);
+}
+
+export interface OrgRecoveryWrappedVaultKey {
+  encryptedVaultKey: string;
+  iv: string;
+  authTag: string;
+  aad: string;
+  ephemeralPublicKey: string;
+  keyVersion: number;
+}
+
+export function splitRecoveryKey(recoveryKeyBytes: Uint8Array): { share1: string; share2: string } {
+  if (recoveryKeyBytes.byteLength !== 32) {
+    throw new RangeError(
+      `Recovery key must be exactly 32 bytes, received ${recoveryKeyBytes.byteLength}`,
+    );
+  }
+  const share1Bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(share1Bytes);
+  const share2Bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    share2Bytes[i] = recoveryKeyBytes[i]! ^ share1Bytes[i]!;
+  }
+  return {
+    share1: bytesToHex(share1Bytes),
+    share2: bytesToHex(share2Bytes),
+  };
+}
+
+export function combineRecoveryKey(
+  share1: string | Uint8Array,
+  share2: string | Uint8Array,
+): Uint8Array {
+  const s1 = typeof share1 === "string" ? hexToBytes(share1) : share1;
+  const s2 = typeof share2 === "string" ? hexToBytes(share2) : share2;
+  if (s1.byteLength !== 32 || s2.byteLength !== 32) {
+    throw new RangeError("Both recovery key shares must be exactly 32 bytes");
+  }
+  const combined = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) {
+    combined[i] = s1[i]! ^ s2[i]!;
+  }
+  return combined;
+}
+
+export async function generateOrgRecoveryKeyPair(): Promise<{
+  publicKey: string;
+  privateKeyBytes: Uint8Array;
+}> {
+  const pair = (await globalThis.crypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveKey",
+    "deriveBits",
+  ])) as CryptoKeyPair;
+
+  const rawPub = await globalThis.crypto.subtle.exportKey("raw", pair.publicKey);
+  const pkcs8Priv = await globalThis.crypto.subtle.exportKey("pkcs8", pair.privateKey);
+
+  const privBytes = new Uint8Array(pkcs8Priv);
+  const rawPriv = privBytes.subarray(privBytes.byteLength - 32);
+  const outPriv = new Uint8Array(32);
+  outPriv.set(rawPriv);
+
+  return {
+    publicKey: bytesToBase64(new Uint8Array(rawPub)),
+    privateKeyBytes: outPriv,
+  };
+}
+
+export async function wrapVaultKeyWithOrgRecoveryKey(
+  vaultKeyBytes: Uint8Array,
+  orgRecoveryPublicKey: CryptoKey | Uint8Array | string,
+  vaultId: string,
+  keyVersion: number,
+): Promise<OrgRecoveryWrappedVaultKey> {
+  if (vaultKeyBytes.byteLength !== AES_GCM_KEY_BYTES) {
+    throw new RangeError(
+      `VaultKey must be ${AES_GCM_KEY_BYTES} bytes, received ${vaultKeyBytes.byteLength}`,
+    );
+  }
+  const pubKey = await resolveX25519PublicKey(orgRecoveryPublicKey);
+  const ephemeralPair = (await globalThis.crypto.subtle.generateKey({ name: "X25519" }, true, [
+    "deriveKey",
+    "deriveBits",
+  ])) as CryptoKeyPair;
+
+  const sharedBits = await globalThis.crypto.subtle.deriveBits(
+    {
+      name: "X25519",
+      public: pubKey,
+    },
+    ephemeralPair.privateKey,
+    256,
+  );
+  const sharedBytes = new Uint8Array(sharedBits);
+  let wrappingKey: CryptoKey;
+  try {
+    const hkdfKey = await globalThis.crypto.subtle.importKey(
+      "raw",
+      toBuffer(sharedBytes),
+      "HKDF",
+      false,
+      ["deriveKey"],
+    );
+    const infoBytes = textEncoder.encode(`llm-vault/v1/org-recovery-key:${vaultId}:${keyVersion}`);
+    wrappingKey = await globalThis.crypto.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: new ArrayBuffer(32),
+        info: toBuffer(infoBytes),
+      },
+      hkdfKey,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"],
+    );
+  } finally {
+    zeroizeBuffer(sharedBytes);
+  }
+
+  const aad = `org-recovery:${vaultId}:${keyVersion}`;
+  const iv = new Uint8Array(AES_GCM_IV_BYTES);
+  globalThis.crypto.getRandomValues(iv);
+
+  const encryptedBuffer = await globalThis.crypto.subtle.encrypt(
+    {
+      name: "AES-GCM",
+      iv: toBuffer(iv),
+      additionalData: toBuffer(textEncoder.encode(aad)),
+      tagLength: AES_GCM_TAG_BITS,
+    },
+    wrappingKey,
+    toBuffer(vaultKeyBytes),
+  );
+
+  const encryptedBytes = new Uint8Array(encryptedBuffer);
+  const ciphertextLength = encryptedBytes.byteLength - AES_GCM_TAG_BYTES;
+  const rawEphemeralPub = await globalThis.crypto.subtle.exportKey("raw", ephemeralPair.publicKey);
+
+  return {
+    encryptedVaultKey: bytesToBase64(encryptedBytes.subarray(0, ciphertextLength)),
+    iv: bytesToBase64(iv),
+    authTag: bytesToBase64(encryptedBytes.subarray(ciphertextLength)),
+    aad,
+    ephemeralPublicKey: bytesToBase64(new Uint8Array(rawEphemeralPub)),
+    keyVersion,
+  };
+}
+
+export async function unwrapVaultKeyWithOrgRecoveryKey(
+  wrappedRecord: OrgRecoveryWrappedVaultKey,
+  orgRecoveryPrivateKey: CryptoKey | Uint8Array,
+  vaultId: string,
+): Promise<Uint8Array> {
+  const expectedAad = `org-recovery:${vaultId}:${wrappedRecord.keyVersion}`;
+  if (wrappedRecord.aad !== expectedAad) {
+    throw new Error("OrgRecoveryWrappedVaultKey AAD mismatch");
+  }
+
+  const privKey = await resolveX25519PrivateKey(orgRecoveryPrivateKey);
+  const ephemeralPubKey = await resolveX25519PublicKey(wrappedRecord.ephemeralPublicKey);
+
+  const sharedBits = await globalThis.crypto.subtle.deriveBits(
+    {
+      name: "X25519",
+      public: ephemeralPubKey,
+    },
+    privKey,
+    256,
+  );
+  const sharedBytes = new Uint8Array(sharedBits);
+  let wrappingKey: CryptoKey;
+  try {
+    const hkdfKey = await globalThis.crypto.subtle.importKey(
+      "raw",
+      toBuffer(sharedBytes),
+      "HKDF",
+      false,
+      ["deriveKey"],
+    );
+    const infoBytes = textEncoder.encode(
+      `llm-vault/v1/org-recovery-key:${vaultId}:${wrappedRecord.keyVersion}`,
+    );
+    wrappingKey = await globalThis.crypto.subtle.deriveKey(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: new ArrayBuffer(32),
+        info: toBuffer(infoBytes),
+      },
+      hkdfKey,
+      { name: "AES-GCM", length: 256 },
+      false,
+      ["encrypt", "decrypt"],
+    );
+  } finally {
+    zeroizeBuffer(sharedBytes);
+  }
 
   const iv = base64ToBytes(wrappedRecord.iv);
   const ciphertext = base64ToBytes(wrappedRecord.encryptedVaultKey);
