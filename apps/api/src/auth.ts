@@ -19,7 +19,7 @@ export interface AuthenticatedCaller {
 const activeSessions = new Map<string, { caller: AuthenticatedCaller; expiresAt: number }>();
 
 export function hashServerPassword(clientAuthKeyHex: string, serverSalt: string): string {
-  return crypto.createHmac("sha256", serverSalt).update(clientAuthKeyHex).digest("hex");
+  return crypto.scryptSync(clientAuthKeyHex, serverSalt, 32).toString("hex");
 }
 
 export function hashAgentToken(token: string): string {
@@ -212,6 +212,31 @@ export function createMockSamlResponseXml(claims: {
 </samlp:Response>`;
 }
 
+function extractTagContent(xml: string, openTag: string, closeTag: string): string | null {
+  const start = xml.indexOf(openTag);
+  if (start === -1) return null;
+  const tagEnd = xml.indexOf(">", start + openTag.length);
+  if (tagEnd === -1) return null;
+  const end = xml.indexOf(closeTag, tagEnd + 1);
+  if (end === -1) return null;
+  return xml.slice(tagEnd + 1, end).trim();
+}
+
+function extractAttributeValue(xml: string, attributeName: string): string | null {
+  const attrMarker = `Name="${attributeName}"`;
+  const attrStart = xml.indexOf(attrMarker);
+  if (attrStart === -1) return null;
+  const valOpen = "<saml:AttributeValue";
+  const valStart = xml.indexOf(valOpen, attrStart);
+  if (valStart === -1) return null;
+  const tagEnd = xml.indexOf(">", valStart + valOpen.length);
+  if (tagEnd === -1) return null;
+  const valClose = "</saml:AttributeValue>";
+  const end = xml.indexOf(valClose, tagEnd + 1);
+  if (end === -1) return null;
+  return xml.slice(tagEnd + 1, end).trim();
+}
+
 export function parseMockSamlResponse(samlResponseBase64: string): {
   email: string;
   name: string;
@@ -222,24 +247,18 @@ export function parseMockSamlResponse(samlResponseBase64: string): {
     throw new Error("Invalid SAML response or non-success status");
   }
 
-  const nameIdMatch = xml.match(/<saml:NameID[^>]*>([^<]+)<\/saml:NameID>/i);
-  const emailAttrMatch = xml.match(
-    /Name="email"[^>]*>[\s\S]*?<saml:AttributeValue>([^<]+)<\/saml:AttributeValue>/i,
-  );
-  const email = (emailAttrMatch?.[1] ?? nameIdMatch?.[1] ?? "").trim();
+  const nameId = extractTagContent(xml, "<saml:NameID", "</saml:NameID>");
+  const emailAttr = extractAttributeValue(xml, "email");
+  const email = (emailAttr ?? nameId ?? "").trim();
   if (!email) {
     throw new Error("SAML response does not contain a valid email address");
   }
 
-  const nameAttrMatch = xml.match(
-    /Name="displayName"[^>]*>[\s\S]*?<saml:AttributeValue>([^<]+)<\/saml:AttributeValue>/i,
-  );
-  const name = (nameAttrMatch?.[1] ?? email.split("@")[0] ?? "SAML User").trim();
+  const nameAttr = extractAttributeValue(xml, "displayName");
+  const name = (nameAttr ?? email.split("@")[0] ?? "SAML User").trim();
 
-  const subAttrMatch = xml.match(
-    /Name="sub"[^>]*>[\s\S]*?<saml:AttributeValue>([^<]+)<\/saml:AttributeValue>/i,
-  );
-  const sub = (subAttrMatch?.[1] ?? email).trim();
+  const subAttr = extractAttributeValue(xml, "sub");
+  const sub = (subAttr ?? email).trim();
 
   return { email, name, sub };
 }

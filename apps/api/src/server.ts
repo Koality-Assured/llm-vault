@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import cors from "@fastify/cors";
+import rateLimit from "@fastify/rate-limit";
 import { and, desc, eq } from "drizzle-orm";
 import { generateEntityId } from "@llm-vault/ids";
 import {
@@ -71,6 +72,11 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     });
   }
+
+  void app.register(rateLimit, {
+    max: 1000,
+    timeWindow: "1 minute",
+  });
 
   // Authentication Hook
   app.addHook("preHandler", async (request: FastifyRequest) => {
