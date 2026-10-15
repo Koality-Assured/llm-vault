@@ -16,6 +16,9 @@ import { SecretResolver } from "./resolver.js";
 import { createMemoryFifo } from "./fifo.js";
 import { runCommand } from "./runner.js";
 import { injectTemplate } from "./injector.js";
+import { calculateShannonEntropy, redactSecret, scanContent, scanWorkspace } from "./scanner.js";
+import { absorbFile } from "./absorb.js";
+import { installPreCommitHook, removePreCommitHook, getPreCommitHookStatus } from "./hook.js";
 import { main } from "./cli.js";
 
 describe("@llm-vault/cli", () => {
@@ -427,6 +430,292 @@ DEBUG='true'
           delete process.env.LLM_VAULT_SESSION_FILE;
         }
       }
+    });
+  });
+
+  describe("Slice 9: Pre-Commit Secret Scanner & Repository Migration", () => {
+    describe("Shannon Entropy & Secret Redaction", () => {
+      it("calculates lower entropy for repetitive patterns and high entropy for cryptographic tokens", () => {
+        const repetitive = "AAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        const highEntropy = "7fA9bK2pLmQ8vX4zRwT1yU3eI5oN6";
+        const low = calculateShannonEntropy(repetitive);
+        const high = calculateShannonEntropy(highEntropy);
+
+        expect(low).toBe(0);
+        expect(high).toBeGreaterThan(4.0);
+      });
+
+      it("redacts secrets with leading and trailing preservation or masking", () => {
+        expect(redactSecret("sk-proj-1234567890abcdefghijklmnop")).toMatch(/^sk-p\*\*\*\*mnop$/);
+        expect(redactSecret("short")).toBe("********");
+        expect(redactSecret("")).toBe("[REDACTED]");
+      });
+    });
+
+    describe("Static Credential Scanner (scanContent & scanWorkspace)", () => {
+      it("detects multiple provider credential formats in source code and config", () => {
+        const mockSlack = [
+          "xoxb",
+          "123456789012",
+          "1234567890123",
+          "abcdefghijklmnopqrstuvwx",
+        ].join("-");
+        const mockStripe = ["sk", "test", "51AbCdEfGhIjKlMnOpQrStUvWxYz1234"].join("_");
+        const mockOpenAi = ["sk", "proj", "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"].join("-");
+        const mockAnthropic = ["sk", "ant", "api03", "abcdefghijklmnopqrstuvwxyz0123456789"].join(
+          "-",
+        );
+        const mockGithub = ["ghp", "1234567890abcdefghijklmnopqrstuvwxyz"].join("_");
+        const fixture = [
+          "// Configuration constants",
+          `const openAiKey = "${mockOpenAi}";`,
+          `const anthropicKey = "${mockAnthropic}";`,
+          'const geminiKey = "AIzaSyD-ExampleGoogleGeminiApiKey1234";',
+          'const awsKey = "AKIAIOSFODNN7EXAMPLE";',
+          `const githubPat = "${mockGithub}";`,
+          `const slackToken = "${mockSlack}";`,
+          `const stripeKey = "${mockStripe}";`,
+          'const dbUrl = "postgres://app_user:s3cr3t_p4ssw0rd@db.internal:5432/production";',
+          "-----BEGIN PRIVATE KEY-----",
+          "MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC7...",
+          "-----END PRIVATE KEY-----",
+          "// Already vaulted token should be ignored:",
+          'const safeToken = "{{vault:sec_01jk9876543210}}";',
+        ].join("\n");
+
+        const findings = scanContent(fixture, "src/config.ts");
+        expect(findings.length).toBeGreaterThanOrEqual(8);
+
+        const rulesFound = findings.map((f) => f.ruleId);
+        expect(rulesFound).toContain("openai-api-key");
+        expect(rulesFound).toContain("anthropic-api-key");
+        expect(rulesFound).toContain("google-gemini-key");
+        expect(rulesFound).toContain("aws-access-key-id");
+        expect(rulesFound).toContain("github-token");
+        expect(rulesFound).toContain("slack-token");
+        expect(rulesFound).toContain("stripe-secret-key");
+        expect(rulesFound).toContain("database-url");
+        expect(rulesFound).toContain("private-key");
+
+        // Verify suggested handle prefix
+        for (const f of findings) {
+          expect(f.suggestedHandle).toMatch(/^\{\{vault:sec_[0-9a-zA-Z]{26}\}\}$/);
+          expect(f.redactedValue).toContain("****");
+        }
+      });
+
+      it("recursively scans directory workspace ignoring binary and excluded directories", async () => {
+        const subDir = path.join(tempDir, "workspace");
+        fs.mkdirSync(subDir, { recursive: true });
+
+        // Valid file with secret
+        fs.writeFileSync(
+          path.join(subDir, "app.ts"),
+          'const key = "sk-proj-VerySecretKey1234567890abcdefgh";\n',
+        );
+
+        // Binary file with simulated null byte
+        fs.writeFileSync(
+          path.join(subDir, "logo.png"),
+          Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x0a, 0x1a, 0x0a]),
+        );
+
+        // File in ignored directory (.git / node_modules)
+        const nodeModulesDir = path.join(subDir, "node_modules", "pkg");
+        fs.mkdirSync(nodeModulesDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(nodeModulesDir, "index.js"),
+          'const leaked = "sk-proj-LeakedInNodeModules12345678";\n',
+        );
+
+        const result = await scanWorkspace({ directory: subDir });
+        expect(result.scannedFiles).toBe(1); // Only app.ts (logo.png binary, node_modules ignored)
+        expect(result.findingsCount).toBe(1);
+        expect(result.clean).toBe(false);
+        expect(result.findings[0]?.ruleId).toBe("openai-api-key");
+      });
+    });
+
+    describe("Repository Ingestion & Template Absorption (absorbFile)", () => {
+      it("previews absorption in dry-run mode without modifying filesystem", async () => {
+        const envFile = path.join(tempDir, ".env");
+        const envContent = [
+          "# Production credentials",
+          "OPENAI_API_KEY=sk-proj-ProductionSecretKey1234567890abcdef",
+          "DATABASE_URL=postgres://admin:topsecret12345@db.prod:5432/main",
+        ].join("\n");
+        fs.writeFileSync(envFile, envContent);
+
+        const result = await absorbFile({
+          targetFile: envFile,
+          dryRun: true,
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.dryRun).toBe(true);
+        expect(result.absorbedCount).toBe(2);
+        expect(result.actions).toHaveLength(2);
+
+        // Verify filesystem was NOT modified
+        expect(fs.readFileSync(envFile, "utf8")).toBe(envContent);
+        expect(fs.existsSync(`${envFile}.tpl`)).toBe(false);
+      });
+
+      it("migrates .env to .env.tpl with {{vault:sec_...}} handles and updates .gitignore", async () => {
+        const envFile = path.join(tempDir, ".env");
+        const gitignoreFile = path.join(tempDir, ".gitignore");
+        fs.writeFileSync(gitignoreFile, "node_modules/\ndist/\n");
+
+        const mockStripeKey = ["sk", "test", "12345678901234567890abcdef"].join("_");
+        const mockGithubToken = ["ghp", "1234567890abcdefghijklmnopqrstuvwxyz"].join("_");
+        const envContent = [
+          "# Application Keys",
+          `STRIPE_SECRET_KEY=${mockStripeKey}`,
+          `GITHUB_TOKEN=${mockGithubToken}`,
+        ].join("\n");
+        fs.writeFileSync(envFile, envContent);
+
+        const savedSecrets: Array<{ name: string; value: string; id: string }> = [];
+
+        // Temporarily change process.cwd for .gitignore handling
+        const originalCwd = process.cwd();
+        try {
+          process.chdir(tempDir);
+
+          const result = await absorbFile({
+            targetFile: ".env",
+            dryRun: false,
+            generateTemplate: true,
+            onSecretSaved: async (name, value, id) => {
+              savedSecrets.push({ name, value, id });
+            },
+          });
+
+          expect(result.success).toBe(true);
+          expect(result.dryRun).toBe(false);
+          expect(result.absorbedCount).toBe(2);
+          expect(savedSecrets).toHaveLength(2);
+
+          // Verify template was created
+          const tplFile = path.join(tempDir, ".env.tpl");
+          expect(fs.existsSync(tplFile)).toBe(true);
+          const tplContent = fs.readFileSync(tplFile, "utf8");
+          expect(tplContent).toContain("STRIPE_SECRET_KEY={{vault:sec_");
+          expect(tplContent).toContain("GITHUB_TOKEN={{vault:sec_");
+          expect(tplContent).toContain("# Application Keys"); // Preserved comment
+
+          // Verify .gitignore was updated to exclude .env
+          const gitignoreContent = fs.readFileSync(gitignoreFile, "utf8");
+          expect(gitignoreContent).toContain(".env");
+        } finally {
+          process.chdir(originalCwd);
+        }
+      });
+    });
+
+    describe("Git Pre-Commit Hook Management", () => {
+      it("installs, verifies status, and uninstalls pre-commit hook in .git repository", () => {
+        const mockRepo = path.join(tempDir, "mock-repo");
+        const hooksDir = path.join(mockRepo, ".git", "hooks");
+        fs.mkdirSync(hooksDir, { recursive: true });
+
+        // 1. Initial status: not installed
+        const status1 = getPreCommitHookStatus(mockRepo);
+        expect(status1.installed).toBe(false);
+
+        // 2. Install hook
+        const installResult = installPreCommitHook(mockRepo);
+        expect(installResult.installed).toBe(true);
+        expect(installResult.isLlmVaultHook).toBe(true);
+        expect(installResult.executable).toBe(true);
+
+        const hookFile = path.join(hooksDir, "pre-commit");
+        expect(fs.existsSync(hookFile)).toBe(true);
+        const hookScript = fs.readFileSync(hookFile, "utf8");
+        expect(hookScript).toContain("llm-vault scan --staged --fail-on-found");
+
+        // 3. Status check
+        const status2 = getPreCommitHookStatus(mockRepo);
+        expect(status2.installed).toBe(true);
+        expect(status2.isLlmVaultHook).toBe(true);
+
+        // 4. Uninstall hook
+        const removeResult = removePreCommitHook(mockRepo);
+        expect(removeResult.installed).toBe(false);
+        expect(fs.existsSync(hookFile)).toBe(false);
+      });
+    });
+
+    describe("CLI Commands: scan, absorb, hook", () => {
+      it("executes llm-vault scan and returns 0 on clean workspace or 1 on fail-on-found", async () => {
+        const cleanDir = path.join(tempDir, "clean");
+        fs.mkdirSync(cleanDir);
+        fs.writeFileSync(path.join(cleanDir, "clean.ts"), 'const greeting = "Hello World";\n');
+
+        let logs: string[] = [];
+        const originalLog = console.log;
+        console.log = (msg: string) => logs.push(msg);
+
+        try {
+          const cleanCode = await main(["scan", "--dir", cleanDir, "--json"]);
+          expect(cleanCode).toBe(0);
+          const parsed = JSON.parse(logs[0]!) as { clean: boolean; findingsCount: number };
+          expect(parsed.clean).toBe(true);
+          expect(parsed.findingsCount).toBe(0);
+
+          // Add a secret and test --fail-on-found
+          fs.writeFileSync(
+            path.join(cleanDir, "dirty.ts"),
+            'const key = "sk-proj-Secret1234567890abcdefghijkl";\n',
+          );
+          logs = [];
+          const dirtyCode = await main(["scan", "--dir", cleanDir, "--fail-on-found", "--json"]);
+          expect(dirtyCode).toBe(1);
+          const dirtyParsed = JSON.parse(logs[0]!) as { clean: boolean; findingsCount: number };
+          expect(dirtyParsed.clean).toBe(false);
+          expect(dirtyParsed.findingsCount).toBe(1);
+        } finally {
+          console.log = originalLog;
+        }
+      });
+
+      it("executes llm-vault absorb in dry-run mode via CLI", async () => {
+        const envFile = path.join(tempDir, ".env");
+        fs.writeFileSync(envFile, "OPENAI_API_KEY=sk-proj-CliAbsorbTestKey1234567890abcdef\n");
+
+        const logs: string[] = [];
+        const originalLog = console.log;
+        console.log = (msg: string) => logs.push(msg);
+
+        try {
+          const code = await main(["absorb", envFile, "--dry-run", "--json"]);
+          expect(code).toBe(0);
+          const res = JSON.parse(logs[0]!) as {
+            success: boolean;
+            dryRun: boolean;
+            absorbedCount: number;
+          };
+          expect(res.success).toBe(true);
+          expect(res.dryRun).toBe(true);
+          expect(res.absorbedCount).toBe(1);
+        } finally {
+          console.log = originalLog;
+        }
+      });
+
+      it("executes llm-vault hook status via CLI", async () => {
+        const logs: string[] = [];
+        const originalLog = console.log;
+        console.log = (msg: string) => logs.push(msg);
+
+        try {
+          const code = await main(["hook", "status"]);
+          expect(code === 0 || code === 1).toBe(true);
+          expect(logs.some((l) => l.includes("Git Pre-Commit Hook Status"))).toBe(true);
+        } finally {
+          console.log = originalLog;
+        }
+      });
     });
   });
 });

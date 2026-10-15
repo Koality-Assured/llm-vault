@@ -4,3 +4,6 @@ export * from "./fifo.js";
 export * from "./resolver.js";
 export * from "./runner.js";
 export * from "./injector.js";
+export * from "./scanner.js";
+export * from "./absorb.js";
+export * from "./hook.js";

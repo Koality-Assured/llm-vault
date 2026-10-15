@@ -680,3 +680,58 @@ export const RotationStatusResponseSchema = z.object({
   dueForRotation: z.boolean(),
 });
 export type RotationStatusResponse = z.infer<typeof RotationStatusResponseSchema>;
+
+// ---------------------------------------------------------------------------
+// Slice 9: Pre-Commit Secret Scanner & Repository Migration
+// ---------------------------------------------------------------------------
+
+export const SecretScanFindingSchema = z.object({
+  id: z.string(),
+  filePath: z.string(),
+  line: z.number().int().min(1),
+  column: z.number().int().min(1),
+  ruleId: z.string(),
+  description: z.string(),
+  redactedValue: z.string(),
+  rawValue: z.string(),
+  entropy: z.number(),
+  suggestedHandle: z.string().optional(),
+});
+export type SecretScanFinding = z.infer<typeof SecretScanFindingSchema>;
+
+export const SecretScanResultSchema = z.object({
+  scannedFiles: z.number().int().nonnegative(),
+  findingsCount: z.number().int().nonnegative(),
+  findings: z.array(SecretScanFindingSchema),
+  clean: z.boolean(),
+  durationMs: z.number().nonnegative(),
+});
+export type SecretScanResult = z.infer<typeof SecretScanResultSchema>;
+
+export const AbsorbActionSchema = z.object({
+  filePath: z.string(),
+  line: z.number().int().min(1),
+  secretName: z.string(),
+  secretId: SecretIdSchema,
+  handle: z.string(),
+  templatePath: z.string().optional(),
+  replaced: z.boolean(),
+});
+export type AbsorbAction = z.infer<typeof AbsorbActionSchema>;
+
+export const AbsorbSecretsResponseSchema = z.object({
+  success: z.boolean(),
+  dryRun: z.boolean(),
+  vaultId: VaultIdSchema.optional(),
+  absorbedCount: z.number().int().nonnegative(),
+  actions: z.array(AbsorbActionSchema),
+});
+export type AbsorbSecretsResponse = z.infer<typeof AbsorbSecretsResponseSchema>;
+
+export const PreCommitHookStatusSchema = z.object({
+  installed: z.boolean(),
+  hookPath: z.string(),
+  executable: z.boolean(),
+  isLlmVaultHook: z.boolean(),
+});
+export type PreCommitHookStatus = z.infer<typeof PreCommitHookStatusSchema>;
