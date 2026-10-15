@@ -11,6 +11,7 @@ import {
   AdminUpdateUserRequestSchema,
   ApproveRecoveryRequestSchema,
   BitwardenExportSchema,
+  CreateWorkloadBindingRequestSchema,
   CsvSecretImportSchema,
   EncryptedBackupContainerSchema,
   InitiateRecoveryRequestSchema,
@@ -19,6 +20,7 @@ import {
   SYSTEM_ROLE_PERMISSIONS,
   VAULT_ROLES,
   VAULT_ROLE_PERMISSIONS,
+  WorkloadIdentityExchangeRequestSchema,
   isMcpAllowedScope,
   type PermissionScope,
   type SystemRole,
@@ -37,6 +39,7 @@ import {
   users,
   vaultMemberKeys,
   vaults,
+  workloadBindings,
 } from "@llm-vault/schema/db/sqlite";
 import {
   authenticateRequest,
@@ -55,7 +58,9 @@ import {
   combineRecoveryKey,
   createEncryptedBackup,
   encryptWithAad,
+  evaluateClaimFilters,
   generateVaultKey,
+  parseJwt,
   restoreEncryptedBackup,
   sanitizeImportString,
   unwrapVaultKeyWithOrgRecoveryKey,
@@ -1638,12 +1643,13 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
     if (caller.actorType === "agent") {
       const agList = database.db.select().from(agents).where(eq(agents.id, caller.actorId)).all();
       const ag = agList[0];
-      if (ag?.vaultRole === "SecretReader") {
+      const effectiveRole = ag?.vaultRole ?? caller.vaultRole;
+      if (effectiveRole === "SecretReader") {
         return reply
           .status(403)
           .send({ error: "Forbidden: SecretReader role cannot reveal secrets." });
       }
-      if (ag && ag.vaultId === secret.vaultId) {
+      if (ag && ag.vaultId === secret.vaultId && ag.agentEncryptedVaultKey) {
         callerVaultKeyEnvelope = {
           ciphertext: ag.agentEncryptedVaultKey,
           iv: ag.iv,
@@ -1651,6 +1657,27 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
           aad: ag.aad,
           keyVersion: ag.keyVersion,
         };
+      } else {
+        const memList = database.db
+          .select()
+          .from(vaultMemberKeys)
+          .where(
+            and(
+              eq(vaultMemberKeys.vaultId, secret.vaultId),
+              eq(vaultMemberKeys.tenantId, caller.tenantId),
+            ),
+          )
+          .all();
+        const mem = memList[0];
+        if (mem && mem.encryptedVaultKey) {
+          callerVaultKeyEnvelope = {
+            ciphertext: mem.encryptedVaultKey,
+            iv: mem.iv,
+            authTag: mem.authTag,
+            aad: mem.aad,
+            keyVersion: mem.keyVersion,
+          };
+        }
       }
     } else {
       const memList = database.db
@@ -3169,6 +3196,348 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       vaultId,
       importedCount,
     });
+  });
+
+  // --- Slice 7: Workload Identity Federation ---
+
+  // Exchange OIDC / SPIFFE token for ephemeral machine session and wrapped vault key
+  app.post("/api/v1/auth/workload-identity/exchange", async (request, reply) => {
+    const parsed = WorkloadIdentityExchangeRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid workload identity exchange request format.",
+        details: parsed.error.issues,
+      });
+    }
+
+    const { token, provider, workloadBindingId } = parsed.data;
+
+    // Parse JWT
+    let parsedJwt;
+    try {
+      parsedJwt = parseJwt(token);
+    } catch (err) {
+      return reply.status(401).send({
+        error: `Invalid workload token format: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+
+    const payload = parsedJwt.payload;
+    const tokenIssuer = typeof payload.iss === "string" ? payload.iss : "";
+    const tokenAud = payload.aud;
+
+    // Query active workload bindings
+    let candidateBindings = database.db
+      .select()
+      .from(workloadBindings)
+      .where(eq(workloadBindings.status, "active"))
+      .all();
+
+    if (workloadBindingId) {
+      candidateBindings = candidateBindings.filter((b) => b.id === workloadBindingId);
+    } else {
+      candidateBindings = candidateBindings.filter(
+        (b) => b.provider === provider && b.issuer === tokenIssuer,
+      );
+    }
+
+    // Find matching binding where audience and claim filters match
+    let matchedBinding = null;
+    for (const binding of candidateBindings) {
+      // Validate audience
+      let audMatches = false;
+      if (typeof tokenAud === "string") {
+        audMatches = tokenAud === binding.audience;
+      } else if (Array.isArray(tokenAud)) {
+        audMatches = tokenAud.includes(binding.audience);
+      }
+      if (!audMatches) continue;
+
+      // Validate claim filters
+      let filters: Record<string, string | string[]> = {};
+      try {
+        filters = JSON.parse(binding.claimFilters) as Record<string, string | string[]>;
+      } catch {
+        continue;
+      }
+
+      if (evaluateClaimFilters(payload, filters)) {
+        // Validate token expiration if exp claim is present
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        if (typeof payload.exp === "number" && nowSeconds > payload.exp + 60) {
+          return reply.status(401).send({ error: "Workload token has expired." });
+        }
+        matchedBinding = binding;
+        break;
+      }
+    }
+
+    if (!matchedBinding) {
+      return reply.status(403).send({
+        error: "Workload token claims do not match any active workload binding policy.",
+        claims: {
+          iss: payload.iss,
+          sub: payload.sub,
+          aud: payload.aud,
+          repository: payload.repository,
+          ref: payload.ref,
+        },
+      });
+    }
+
+    // Verify target vault exists
+    const vault = database.db
+      .select()
+      .from(vaults)
+      .where(
+        and(eq(vaults.id, matchedBinding.vaultId), eq(vaults.tenantId, matchedBinding.tenantId)),
+      )
+      .all()[0];
+
+    if (!vault) {
+      return reply
+        .status(404)
+        .send({ error: `Target vault "${matchedBinding.vaultId}" not found.` });
+    }
+
+    // Retrieve caller's wrapped vault key
+    const memberKey = database.db
+      .select()
+      .from(vaultMemberKeys)
+      .where(
+        and(
+          eq(vaultMemberKeys.vaultId, vault.id),
+          eq(vaultMemberKeys.tenantId, matchedBinding.tenantId),
+        ),
+      )
+      .all()[0];
+
+    // Issue ephemeral machine identity
+    const agentId = generateEntityId("agt_");
+    const ttlSeconds = matchedBinding.tokenTtlSeconds;
+    const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+
+    const scopes: PermissionScope[] = [];
+    if (matchedBinding.vaultRole === "SecretReader") {
+      scopes.push("secrets:read");
+    } else if (matchedBinding.vaultRole === "SecretConsumer") {
+      scopes.push("secrets:read", "secrets:reveal");
+    } else if (matchedBinding.vaultRole === "SecretEditor") {
+      scopes.push("secrets:read", "secrets:create", "secrets:update", "secrets:reveal");
+    } else {
+      scopes.push(
+        "secrets:read",
+        "secrets:create",
+        "secrets:update",
+        "secrets:reveal",
+        "vaults:rotate_key",
+      );
+    }
+
+    const caller: AuthenticatedCaller = {
+      actorId: agentId,
+      actorType: "agent",
+      tenantId: matchedBinding.tenantId,
+      vaultRole: matchedBinding.vaultRole,
+      scopes,
+      allowRawContextReveal: matchedBinding.vaultRole !== "SecretReader",
+    };
+
+    const ephemeralSessionToken = issueSessionToken(caller, 1, ttlSeconds);
+
+    database.db
+      .insert(agents)
+      .values({
+        id: agentId,
+        tenantId: matchedBinding.tenantId,
+        vaultId: matchedBinding.vaultId,
+        name: `Workload: ${matchedBinding.name}`,
+        description: `Ephemeral machine identity exchanged via ${matchedBinding.provider}`,
+        vaultRole: matchedBinding.vaultRole,
+        scopesJson: JSON.stringify(scopes),
+        keyVersion: memberKey?.keyVersion ?? 1,
+        agentEncryptedVaultKey: memberKey?.encryptedVaultKey ?? "",
+        iv: memberKey?.iv ?? "",
+        authTag: memberKey?.authTag ?? "",
+        aad: memberKey?.aad ?? "",
+        allowRawContextReveal: matchedBinding.vaultRole !== "SecretReader",
+        tokenHash: hashAgentToken(ephemeralSessionToken),
+        status: "active",
+        createdByUserId: vault.createdByUserId,
+        createdAt: new Date().toISOString(),
+      })
+      .run();
+
+    recordAudit(
+      matchedBinding.tenantId,
+      matchedBinding.vaultId,
+      agentId,
+      "agent",
+      "workload_identity:exchange",
+      matchedBinding.id,
+      request.ip,
+      {
+        bindingId: matchedBinding.id,
+        provider: matchedBinding.provider,
+        sub: payload.sub,
+        repository: payload.repository,
+        ref: payload.ref,
+        expiresAt,
+      },
+    );
+
+    return reply.status(200).send({
+      token: ephemeralSessionToken,
+      tenantId: matchedBinding.tenantId,
+      actorId: agentId,
+      agentId,
+      vaultId: matchedBinding.vaultId,
+      vaultRole: matchedBinding.vaultRole,
+      expiresAt,
+      encryptedVaultKey: memberKey
+        ? {
+            ciphertext: memberKey.encryptedVaultKey,
+            iv: memberKey.iv,
+            authTag: memberKey.authTag,
+            aad: memberKey.aad,
+            keyVersion: memberKey.keyVersion,
+          }
+        : undefined,
+    });
+  });
+
+  // Create workload binding for a vault
+  app.post("/api/v1/vaults/:vaultId/workload-bindings", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+
+    const { vaultId } = request.params as { vaultId: string };
+    const parsed = CreateWorkloadBindingRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply
+        .status(400)
+        .send({ error: "Invalid workload binding schema.", details: parsed.error.issues });
+    }
+
+    const vault = database.db
+      .select()
+      .from(vaults)
+      .where(and(eq(vaults.id, vaultId), eq(vaults.tenantId, caller.tenantId)))
+      .all()[0];
+    if (!vault) {
+      return reply.status(404).send({ error: `Vault "${vaultId}" not found.` });
+    }
+
+    const bindingId = generateEntityId("wkb_");
+    const now = new Date().toISOString();
+
+    database.db
+      .insert(workloadBindings)
+      .values({
+        id: bindingId,
+        tenantId: caller.tenantId,
+        vaultId,
+        name: parsed.data.name.trim(),
+        provider: parsed.data.provider,
+        issuer: parsed.data.issuer.trim(),
+        audience: parsed.data.audience.trim(),
+        claimFilters: JSON.stringify(parsed.data.claimFilters),
+        vaultRole: parsed.data.vaultRole,
+        tokenTtlSeconds: parsed.data.tokenTtlSeconds,
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "workload_binding:create",
+      bindingId,
+      request.ip,
+      { bindingId, name: parsed.data.name, provider: parsed.data.provider },
+    );
+
+    return reply.status(201).send({
+      binding: {
+        id: bindingId,
+        tenantId: caller.tenantId,
+        vaultId,
+        name: parsed.data.name.trim(),
+        provider: parsed.data.provider,
+        issuer: parsed.data.issuer.trim(),
+        audience: parsed.data.audience.trim(),
+        claimFilters: parsed.data.claimFilters,
+        vaultRole: parsed.data.vaultRole,
+        tokenTtlSeconds: parsed.data.tokenTtlSeconds,
+        status: "active",
+        createdAt: now,
+        updatedAt: now,
+      },
+    });
+  });
+
+  // List workload bindings for a vault
+  app.get("/api/v1/vaults/:vaultId/workload-bindings", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    const { vaultId } = request.params as { vaultId: string };
+
+    const bindings = database.db
+      .select()
+      .from(workloadBindings)
+      .where(
+        and(eq(workloadBindings.vaultId, vaultId), eq(workloadBindings.tenantId, caller.tenantId)),
+      )
+      .all();
+
+    return reply.status(200).send({
+      bindings: bindings.map((b) => ({
+        ...b,
+        claimFilters: JSON.parse(b.claimFilters),
+      })),
+    });
+  });
+
+  // Delete a workload binding
+  app.delete("/api/v1/vaults/:vaultId/workload-bindings/:id", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireHumanAdmin(caller, reply);
+
+    const { vaultId, id } = request.params as { vaultId: string; id: string };
+
+    const existing = database.db
+      .select()
+      .from(workloadBindings)
+      .where(
+        and(
+          eq(workloadBindings.id, id),
+          eq(workloadBindings.vaultId, vaultId),
+          eq(workloadBindings.tenantId, caller.tenantId),
+        ),
+      )
+      .all()[0];
+
+    if (!existing) {
+      return reply.status(404).send({ error: `Workload binding "${id}" not found.` });
+    }
+
+    database.db.delete(workloadBindings).where(eq(workloadBindings.id, id)).run();
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "workload_binding:delete",
+      id,
+      request.ip,
+      { bindingId: id },
+    );
+
+    return reply.status(200).send({ success: true, deletedId: id });
   });
 
   return app;

@@ -38,6 +38,11 @@ import {
   signAuditOrKeyPayload,
   unwrapUserPrivateKey,
   unwrapVaultKeyForAgent,
+  createTestWorkloadJwt,
+  parseJwt,
+  matchClaimPattern,
+  evaluateClaimFilters,
+  verifyJwtClaims,
   unwrapVaultKeyFromSender,
   verifyAuditHashChain,
   verifyPayloadSignature,
@@ -597,5 +602,102 @@ describe("@llm-vault/crypto", () => {
     expect(sensitive.some((b) => b !== 0)).toBe(true);
     zeroizeBuffer(sensitive);
     expect(sensitive.every((b) => b === 0)).toBe(true);
+  });
+
+  describe("Workload Identity Federation & OIDC Claim Matching", () => {
+    it("parses JWT segments and matches exact, wildcard, and array claims", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const claims = {
+        iss: "https://token.actions.githubusercontent.com",
+        aud: "https://vault.example.com",
+        sub: "repo:Koality-Assured/llm-vault:ref:refs/heads/main",
+        repository: "Koality-Assured/llm-vault",
+        repository_owner: "Koality-Assured",
+        ref: "refs/heads/main",
+        actor: "octocat",
+        environment: "production",
+        roles: ["ci-runner", "builder"],
+        exp: now + 300,
+        nbf: now - 10,
+      };
+
+      const token = await createTestWorkloadJwt(claims);
+      const parsed = parseJwt(token);
+      expect(parsed.payload.repository).toBe("Koality-Assured/llm-vault");
+      expect(parsed.payload.ref).toBe("refs/heads/main");
+
+      // Verify claims validation
+      const verified = verifyJwtClaims(token, {
+        expectedIssuer: "https://token.actions.githubusercontent.com",
+        expectedAudience: "https://vault.example.com",
+      });
+      expect(verified.repository).toBe("Koality-Assured/llm-vault");
+
+      // Claim pattern matching
+      expect(matchClaimPattern("refs/heads/main", "refs/heads/main")).toBe(true);
+      expect(matchClaimPattern("refs/heads/main", "refs/heads/*")).toBe(true);
+      expect(matchClaimPattern("refs/pull/123/merge", "refs/heads/*")).toBe(false);
+      expect(matchClaimPattern("repo:Koality-Assured/llm-vault", "repo:Koality-Assured/*")).toBe(
+        true,
+      );
+      expect(matchClaimPattern("repo:Malicious-Org/llm-vault", "repo:Koality-Assured/*")).toBe(
+        false,
+      );
+      expect(matchClaimPattern(["ci-runner", "builder"], "builder")).toBe(true);
+      expect(matchClaimPattern(["ci-runner", "builder"], "admin")).toBe(false);
+
+      // Evaluate full claim filters
+      const matchingFilters = {
+        repository: "Koality-Assured/llm-vault",
+        ref: "refs/heads/*",
+        environment: "production",
+      };
+      expect(evaluateClaimFilters(claims, matchingFilters)).toBe(true);
+
+      const mismatchingFilters = {
+        repository: "Koality-Assured/llm-vault",
+        ref: "refs/tags/*", // fails
+      };
+      expect(evaluateClaimFilters(claims, mismatchingFilters)).toBe(false);
+    });
+
+    it("rejects expired JWTs and audience or issuer mismatches", async () => {
+      const now = Math.floor(Date.now() / 1000);
+
+      // Expired token
+      const expiredToken = await createTestWorkloadJwt({
+        iss: "https://token.actions.githubusercontent.com",
+        aud: "https://vault.example.com",
+        exp: now - 3600, // 1 hour ago
+      });
+      expect(() =>
+        verifyJwtClaims(expiredToken, {
+          expectedIssuer: "https://token.actions.githubusercontent.com",
+          expectedAudience: "https://vault.example.com",
+          clockToleranceSeconds: 0,
+        }),
+      ).toThrow(/JWT expired/);
+
+      // Issuer mismatch
+      const goodToken = await createTestWorkloadJwt({
+        iss: "https://token.actions.githubusercontent.com",
+        aud: "https://vault.example.com",
+        exp: now + 300,
+      });
+      expect(() =>
+        verifyJwtClaims(goodToken, {
+          expectedIssuer: "https://accounts.google.com",
+          expectedAudience: "https://vault.example.com",
+        }),
+      ).toThrow(/JWT issuer mismatch/);
+
+      // Audience mismatch
+      expect(() =>
+        verifyJwtClaims(goodToken, {
+          expectedIssuer: "https://token.actions.githubusercontent.com",
+          expectedAudience: "https://different-vault.internal",
+        }),
+      ).toThrow(/JWT audience mismatch/);
+    });
   });
 });

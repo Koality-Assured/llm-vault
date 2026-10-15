@@ -16,7 +16,7 @@ import {
 } from "./index.js";
 
 describe("@llm-vault/ids", () => {
-  it("generates and parses valid ULIDs across all 7 entity prefixes", () => {
+  it("generates and parses valid ULIDs across all 8 entity prefixes", () => {
     const fixedTime = 1_728_900_000_000;
 
     for (const prefix of ENTITY_PREFIXES) {

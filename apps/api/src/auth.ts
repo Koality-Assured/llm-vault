@@ -26,9 +26,14 @@ export function hashAgentToken(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-export function issueSessionToken(caller: AuthenticatedCaller, ttlHours: number = 24): string {
+export function issueSessionToken(
+  caller: AuthenticatedCaller,
+  ttlHours: number = 24,
+  ttlSeconds?: number,
+): string {
   const token = `vlt_session_${crypto.randomBytes(32).toString("hex")}`;
-  const expiresAt = Date.now() + ttlHours * 3600 * 1000;
+  const expiresAt =
+    ttlSeconds !== undefined ? Date.now() + ttlSeconds * 1000 : Date.now() + ttlHours * 3600 * 1000;
   activeSessions.set(token, { caller, expiresAt });
   return token;
 }

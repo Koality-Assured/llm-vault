@@ -7,6 +7,7 @@ import { eq } from "drizzle-orm";
 import { sqliteSchema } from "@llm-vault/schema/db/sqlite";
 import { generateEntityId } from "@llm-vault/ids";
 import {
+  createTestWorkloadJwt,
   generateOrgRecoveryKeyPair,
   generateTotpCode,
   generateTotpSecret,
@@ -16,7 +17,7 @@ import {
 } from "@llm-vault/crypto";
 import { buildServer } from "./server.js";
 import { initSchema, type VaultDatabase } from "./db.js";
-import { createMockSamlResponseXml } from "./auth.js";
+import { createMockSamlResponseXml, issueSessionToken } from "./auth.js";
 
 describe("Fastify REST API server (apps/api)", () => {
   let app: FastifyInstance;
@@ -1518,6 +1519,318 @@ describe("Fastify REST API server (apps/api)", () => {
       expect(res.statusCode).toBe(200);
       expect(res.json().status).toBe("imported");
       expect(res.json().importedCount).toBe(1);
+    });
+  });
+
+  describe("Slice 7: Workload Identity Federation (OIDC & SPIFFE for CI/CD & Cloud Workloads)", () => {
+    let s7App: FastifyInstance;
+    let s7Db: VaultDatabase;
+    let s7Token: string;
+    let s7VaultId: string;
+    let s7SecretId: string;
+    const s7TenantId = "tnt_workload_corp";
+    const s7AdminId = "usr_workload_admin_01";
+
+    beforeAll(async () => {
+      const sqlite = new Database(":memory:");
+      initSchema(sqlite);
+      const db = drizzle(sqlite, { schema: sqliteSchema });
+      s7Db = { db, sqlite, path: ":memory:" };
+
+      s7App = buildServer({ database: s7Db, enableCors: false });
+      await s7App.ready();
+
+      // Seed tenant & admin user
+      const now = new Date().toISOString();
+      s7Db.db
+        .insert(sqliteSchema.tenants)
+        .values({
+          id: s7TenantId,
+          name: "Workload Federation Corp",
+          slug: "workload-corp",
+          deploymentMode: "enterprise",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      s7Db.db
+        .insert(sqliteSchema.users)
+        .values({
+          id: s7AdminId,
+          tenantId: s7TenantId,
+          email: "admin@workload-corp.local",
+          displayName: "Workload Admin",
+          systemRole: "SuperAdmin",
+          kdfSalt: "0123456789abcdef0123456789abcdef",
+          x25519PublicKey: "placeholder_x25519",
+          ed25519PublicKey: "placeholder_ed25519",
+          publicKeyFingerprint: "fingerprint_123",
+          encryptedX25519PrivateKey: "priv_blob",
+          encryptedEd25519PrivateKey: "priv_blob",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+
+      s7Token = issueSessionToken({
+        actorId: s7AdminId,
+        actorType: "user",
+        tenantId: s7TenantId,
+        email: "admin@workload-corp.local",
+        displayName: "Workload Admin",
+        systemRole: "SuperAdmin",
+        scopes: [
+          "secrets:read",
+          "secrets:write",
+          "secrets:reveal",
+          "secrets:create",
+          "vaults:create",
+          "vaults:share",
+          "vaults:admin",
+          "users:admin",
+        ],
+      });
+
+      // Create a vault
+      const vRes = await s7App.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${s7Token}` },
+        payload: {
+          name: "CI Production Vault",
+          description: "Production secrets for automated deployments",
+          encryptedVaultKey: {
+            ciphertext: "enc_vault_key_ciphertext_blob_12345",
+            iv: "iv_0123456789abcdef",
+            authTag: "auth_tag_0123456789abcdef",
+            aad: "aad_vlt_test",
+          },
+        },
+      });
+      expect(vRes.statusCode).toBe(201);
+      s7VaultId = vRes.json().id;
+
+      // Create a secret in the vault
+      const sRes = await s7App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s7VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s7Token}` },
+        payload: {
+          id: generateEntityId("sec_"),
+          vaultId: s7VaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            ciphertext: "enc_meta",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_meta",
+          },
+          encryptedPayload: {
+            ciphertext: "enc_payload_secret_val",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_payload",
+          },
+          tagBlindIndexes: [],
+        },
+      });
+      expect(sRes.statusCode).toBe(201);
+      s7SecretId = sRes.json().id;
+    });
+
+    afterAll(async () => {
+      await s7App.close();
+    });
+
+    it("creates, lists, and manages workload bindings on a vault", async () => {
+      // Create binding for GitHub Actions on main branch
+      const res = await s7App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s7VaultId}/workload-bindings`,
+        headers: { authorization: `Bearer ${s7Token}` },
+        payload: {
+          name: "GitHub Actions CI Pipeline",
+          provider: "github-actions",
+          issuer: "https://token.actions.githubusercontent.com",
+          audience: "https://vault.workload-corp.internal",
+          claimFilters: {
+            repository: "Koality-Assured/llm-vault",
+            ref: "refs/heads/main",
+            environment: "production",
+          },
+          vaultRole: "SecretConsumer",
+          tokenTtlSeconds: 300,
+        },
+      });
+      expect(res.statusCode).toBe(201);
+      const binding = res.json().binding;
+      expect(binding.id.startsWith("wkb_")).toBe(true);
+      expect(binding.provider).toBe("github-actions");
+      expect(binding.claimFilters.repository).toBe("Koality-Assured/llm-vault");
+
+      // List bindings
+      const listRes = await s7App.inject({
+        method: "GET",
+        url: `/api/v1/vaults/${s7VaultId}/workload-bindings`,
+        headers: { authorization: `Bearer ${s7Token}` },
+      });
+      expect(listRes.statusCode).toBe(200);
+      expect(listRes.json().bindings.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it("exchanges valid GitHub Actions OIDC token for ephemeral token and wrapped vault key", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const claims = {
+        iss: "https://token.actions.githubusercontent.com",
+        aud: "https://vault.workload-corp.internal",
+        sub: "repo:Koality-Assured/llm-vault:ref:refs/heads/main",
+        repository: "Koality-Assured/llm-vault",
+        ref: "refs/heads/main",
+        environment: "production",
+        exp: now + 300,
+      };
+
+      const idToken = await createTestWorkloadJwt(claims);
+
+      const exchangeRes = await s7App.inject({
+        method: "POST",
+        url: "/api/v1/auth/workload-identity/exchange",
+        payload: {
+          token: idToken,
+          provider: "github-actions",
+        },
+      });
+
+      expect(exchangeRes.statusCode).toBe(200);
+      const data = exchangeRes.json();
+      expect(data.token).toBeDefined();
+      expect(data.actorId.startsWith("agt_")).toBe(true);
+      expect(data.vaultId).toBe(s7VaultId);
+      expect(data.vaultRole).toBe("SecretConsumer");
+      expect(data.encryptedVaultKey).toBeDefined();
+      expect(data.encryptedVaultKey.ciphertext).toBe("enc_vault_key_ciphertext_blob_12345");
+
+      // Verify the issued ephemeral token can reveal secrets from the vault
+      const revealRes = await s7App.inject({
+        method: "POST",
+        url: `/api/v1/secrets/${s7SecretId}/reveal`,
+        headers: { authorization: `Bearer ${data.token}` },
+        payload: { reason: "ci-automated-deployment" },
+      });
+      expect(revealRes.statusCode).toBe(200);
+      expect(revealRes.json().id).toBe(s7SecretId);
+      expect(revealRes.json().encryptedPayload.ciphertext).toBe("enc_payload_secret_val");
+    });
+
+    it("rejects untrusted branch or unauthorized repository with HTTP 403", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      // Untrusted PR branch
+      const unauthClaims = {
+        iss: "https://token.actions.githubusercontent.com",
+        aud: "https://vault.workload-corp.internal",
+        sub: "repo:Koality-Assured/llm-vault:ref:refs/pull/99/merge",
+        repository: "Koality-Assured/llm-vault",
+        ref: "refs/pull/99/merge",
+        environment: "production",
+        exp: now + 300,
+      };
+
+      const unauthJwt = await createTestWorkloadJwt(unauthClaims);
+
+      const res = await s7App.inject({
+        method: "POST",
+        url: "/api/v1/auth/workload-identity/exchange",
+        payload: {
+          token: unauthJwt,
+          provider: "github-actions",
+        },
+      });
+
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error).toContain("do not match any active workload binding policy");
+    });
+
+    it("rejects expired workload token with HTTP 401", async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const expiredClaims = {
+        iss: "https://token.actions.githubusercontent.com",
+        aud: "https://vault.workload-corp.internal",
+        repository: "Koality-Assured/llm-vault",
+        ref: "refs/heads/main",
+        environment: "production",
+        exp: now - 120, // expired 2 minutes ago
+      };
+
+      const expiredJwt = await createTestWorkloadJwt(expiredClaims);
+
+      const res = await s7App.inject({
+        method: "POST",
+        url: "/api/v1/auth/workload-identity/exchange",
+        payload: {
+          token: expiredJwt,
+          provider: "github-actions",
+        },
+      });
+
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error).toContain("expired");
+    });
+
+    it("supports SPIFFE / Kubernetes JWT SVID workload identity binding", async () => {
+      // 1. Create SPIFFE binding
+      const createRes = await s7App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s7VaultId}/workload-bindings`,
+        headers: { authorization: `Bearer ${s7Token}` },
+        payload: {
+          name: "Kubernetes Payment Service Pods",
+          provider: "spiffe-jwt",
+          issuer: "https://spiffe.internal",
+          audience: "llm-vault",
+          claimFilters: {
+            sub: "spiffe://example.org/ns/production/sa/payment-service",
+          },
+          vaultRole: "SecretReader",
+          tokenTtlSeconds: 120,
+        },
+      });
+      expect(createRes.statusCode).toBe(201);
+      const bindingId = createRes.json().binding.id;
+
+      // 2. Exchange SPIFFE JWT SVID
+      const now = Math.floor(Date.now() / 1000);
+      const spiffeClaims = {
+        iss: "https://spiffe.internal",
+        aud: "llm-vault",
+        sub: "spiffe://example.org/ns/production/sa/payment-service",
+        exp: now + 120,
+      };
+
+      const spiffeToken = await createTestWorkloadJwt(spiffeClaims);
+
+      const exchRes = await s7App.inject({
+        method: "POST",
+        url: "/api/v1/auth/workload-identity/exchange",
+        payload: {
+          token: spiffeToken,
+          provider: "spiffe-jwt",
+        },
+      });
+
+      expect(exchRes.statusCode).toBe(200);
+      expect(exchRes.json().vaultId).toBe(s7VaultId);
+      expect(exchRes.json().token).toBeDefined();
+
+      // 3. Delete binding
+      const delRes = await s7App.inject({
+        method: "DELETE",
+        url: `/api/v1/vaults/${s7VaultId}/workload-bindings/${bindingId}`,
+        headers: { authorization: `Bearer ${s7Token}` },
+      });
+      expect(delRes.statusCode).toBe(200);
+      expect(delRes.json().success).toBe(true);
     });
   });
 });
