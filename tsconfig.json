@@ -4,6 +4,7 @@
     { "path": "packages/ids" },
     { "path": "packages/crypto" },
     { "path": "packages/schema" },
-    { "path": "apps/api" }
+    { "path": "apps/api" },
+    { "path": "apps/cli" }
   ]
 }
