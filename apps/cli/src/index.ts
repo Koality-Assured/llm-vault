@@ -7,3 +7,5 @@ export * from "./injector.js";
 export * from "./scanner.js";
 export * from "./absorb.js";
 export * from "./hook.js";
+export * from "./ssh-agent.js";
+export * from "./sidecar.js";

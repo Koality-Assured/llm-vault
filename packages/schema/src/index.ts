@@ -735,3 +735,67 @@ export const PreCommitHookStatusSchema = z.object({
   isLlmVaultHook: z.boolean(),
 });
 export type PreCommitHookStatus = z.infer<typeof PreCommitHookStatusSchema>;
+
+// ---------------------------------------------------------------------------
+// Slice 10: SSH Agent, Git Commit Signing & Kubernetes External Secrets Operator (ESO)
+// ---------------------------------------------------------------------------
+
+export const SshKeyIdentitySchema = z.object({
+  id: z.string(),
+  publicKeyOpenSsh: z.string(),
+  comment: z.string(),
+  fingerprint: z.string(),
+  createdAt: z.string(),
+  approvalRequired: z.boolean().default(true),
+});
+export type SshKeyIdentity = z.infer<typeof SshKeyIdentitySchema>;
+
+export const SshAgentStatusSchema = z.object({
+  running: z.boolean(),
+  socketPath: z.string(),
+  keyCount: z.number().int().nonnegative(),
+  keys: z.array(SshKeyIdentitySchema),
+  approvalMode: z.enum(["auto", "interactive", "oob"]),
+});
+export type SshAgentStatus = z.infer<typeof SshAgentStatusSchema>;
+
+export const K8sEsoSecretSyncItemSchema = z.object({
+  secretId: SecretIdSchema,
+  name: z.string().optional(),
+  version: z.number().int().min(1),
+  ciphertext: z.string(),
+  iv: z.string(),
+  authTag: z.string(),
+  aad: z.string(),
+  updatedAt: z.string(),
+});
+export type K8sEsoSecretSyncItem = z.infer<typeof K8sEsoSecretSyncItemSchema>;
+
+export const K8sEsoSecretSyncRequestSchema = z.object({
+  vaultId: VaultIdSchema,
+  secretIds: z.array(SecretIdSchema).optional(),
+  targetNamespace: z.string().optional(),
+});
+export type K8sEsoSecretSyncRequest = z.infer<typeof K8sEsoSecretSyncRequestSchema>;
+
+export const K8sEsoSecretSyncResponseSchema = z.object({
+  vaultId: VaultIdSchema,
+  syncedAt: z.string(),
+  secrets: z.array(K8sEsoSecretSyncItemSchema),
+});
+export type K8sEsoSecretSyncResponse = z.infer<typeof K8sEsoSecretSyncResponseSchema>;
+
+export const ContainerSidecarConfigSchema = z.object({
+  vaultId: VaultIdSchema,
+  mountPath: z.string().default("/vault/secrets"),
+  refreshIntervalSeconds: z.number().int().min(1).default(30),
+  inMemoryVolume: z.boolean().default(true),
+  secrets: z.array(
+    z.object({
+      secretId: SecretIdSchema,
+      outputFilename: z.string(),
+      permissions: z.string().optional(),
+    }),
+  ),
+});
+export type ContainerSidecarConfig = z.infer<typeof ContainerSidecarConfigSchema>;

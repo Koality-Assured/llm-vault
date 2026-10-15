@@ -61,6 +61,17 @@ import {
   generateProviderCredential,
   verifyProviderCredential,
   revokeProviderCredential,
+  formatOpenSshPublicKey,
+  parseOpenSshPublicKey,
+  computeSshKeyFingerprint,
+  SSH_AGENT_MSG,
+  encodeSshAgentPacket,
+  decodeSshAgentPacket,
+  encodeIdentitiesAnswer,
+  decodeSignRequest,
+  encodeSignResponse,
+  encodeAgentFailure,
+  encodeAgentSuccess,
 } from "./index.js";
 
 describe("@llm-vault/crypto", () => {
@@ -771,6 +782,104 @@ describe("@llm-vault/crypto", () => {
         targetResourceId: "analytics_user",
       });
       expect(myCred.remediationCommand).toContain("ALTER USER 'analytics_user'@'%' IDENTIFIED BY");
+    });
+  });
+
+  describe("Slice 10: OpenSSH Ed25519 Wire Encoding & SSH Agent Protocol", () => {
+    it("formats and parses OpenSSH Ed25519 public keys with SHA256 fingerprints", async () => {
+      const userKeys = await generateUserKeyPairs();
+      const rawPublicBytes = userKeys.ed25519.publicKeyBase64
+        ? base64ToBytes(userKeys.ed25519.publicKeyBase64)
+        : new Uint8Array(32);
+
+      const formatted = formatOpenSshPublicKey(rawPublicBytes, "agent@llm-vault");
+      expect(formatted).toMatch(/^ssh-ed25519 [A-Za-z0-9+/=]+ agent@llm-vault$/);
+
+      const parsed = parseOpenSshPublicKey(formatted);
+      expect(parsed.keyType).toBe("ssh-ed25519");
+      expect(parsed.comment).toBe("agent@llm-vault");
+      expect(parsed.publicKeyBytes).toEqual(rawPublicBytes);
+
+      const fingerprint = await computeSshKeyFingerprint(parsed.wireBlob);
+      expect(fingerprint).toMatch(/^SHA256:[A-Za-z0-9+/]+$/);
+    });
+
+    it("rejects invalid or malformed OpenSSH public keys", () => {
+      expect(() => parseOpenSshPublicKey("not-a-valid-key")).toThrow(
+        /Invalid OpenSSH public key format/,
+      );
+      expect(() =>
+        parseOpenSshPublicKey("ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC invalid"),
+      ).toThrow(/Unsupported OpenSSH key type/);
+    });
+
+    it("serializes and deserializes SSH agent packets and identity answers", async () => {
+      const userKeys = await generateUserKeyPairs();
+      const rawPublicBytes = base64ToBytes(userKeys.ed25519.publicKeyBase64);
+
+      // Encode request identities
+      const reqPacket = encodeSshAgentPacket(SSH_AGENT_MSG.SSH2_AGENTC_REQUEST_IDENTITIES);
+      const decodedReq = decodeSshAgentPacket(reqPacket);
+      expect(decodedReq.msgType).toBe(SSH_AGENT_MSG.SSH2_AGENTC_REQUEST_IDENTITIES);
+      expect(decodedReq.payload.length).toBe(0);
+
+      // Encode identities answer
+      const identitiesPacket = encodeIdentitiesAnswer([
+        { publicKeyBytes: rawPublicBytes, comment: "deploy-key" },
+      ]);
+      const decodedAnswer = decodeSshAgentPacket(identitiesPacket);
+      expect(decodedAnswer.msgType).toBe(SSH_AGENT_MSG.SSH2_AGENT_IDENTITIES_ANSWER);
+      expect(decodedAnswer.payload.length).toBeGreaterThan(0);
+
+      // Success & failure responses
+      const failPacket = encodeAgentFailure();
+      expect(decodeSshAgentPacket(failPacket).msgType).toBe(SSH_AGENT_MSG.SSH_AGENT_FAILURE);
+
+      const successPacket = encodeAgentSuccess();
+      expect(decodeSshAgentPacket(successPacket).msgType).toBe(SSH_AGENT_MSG.SSH_AGENT_SUCCESS);
+    });
+
+    it("serializes and deserializes SSH agent sign requests and responses", async () => {
+      const userKeys = await generateUserKeyPairs();
+      const rawPublicBytes = base64ToBytes(userKeys.ed25519.publicKeyBase64);
+      expect(rawPublicBytes.length).toBe(32);
+
+      const dataToSign = new TextEncoder().encode(
+        "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n",
+      );
+      const keyBlob = new Uint8Array([1, 2, 3, 4]);
+
+      // Test sign request decode
+      const keyBlobWire = Buffer.alloc(4 + keyBlob.length);
+      keyBlobWire.writeUInt32BE(keyBlob.length, 0);
+      keyBlobWire.set(keyBlob, 4);
+
+      const dataWire = Buffer.alloc(4 + dataToSign.length);
+      dataWire.writeUInt32BE(dataToSign.length, 0);
+      dataWire.set(dataToSign, 4);
+
+      const signReqPayload = Buffer.concat([keyBlobWire, dataWire]);
+      const decodedReq = decodeSignRequest(signReqPayload);
+      expect(new Uint8Array(decodedReq.keyBlob)).toEqual(keyBlob);
+      expect(new Uint8Array(decodedReq.dataToSign)).toEqual(dataToSign);
+
+      // Sign payload with Ed25519 private key
+      const signatureBytes = await signAuditOrKeyPayload(userKeys.ed25519.privateKey, dataToSign);
+      expect(signatureBytes.length).toBe(64);
+
+      // Verify with Ed25519 public key
+      const valid = await verifyPayloadSignature(
+        userKeys.ed25519.publicKey,
+        dataToSign,
+        signatureBytes,
+      );
+      expect(valid).toBe(true);
+
+      // Encode sign response
+      const signRespPacket = encodeSignResponse(signatureBytes);
+      const decodedResp = decodeSshAgentPacket(signRespPacket);
+      expect(decodedResp.msgType).toBe(SSH_AGENT_MSG.SSH2_AGENT_SIGN_RESPONSE);
+      expect(decodedResp.payload.length).toBeGreaterThan(64);
     });
   });
 });

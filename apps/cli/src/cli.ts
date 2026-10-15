@@ -13,6 +13,9 @@ import { injectTemplate } from "./injector.js";
 import { scanWorkspace } from "./scanner.js";
 import { absorbFile } from "./absorb.js";
 import { installPreCommitHook, removePreCommitHook, getPreCommitHookStatus } from "./hook.js";
+import { startSshAgentServer, querySshAgentIdentities, type ApprovalMode } from "./ssh-agent.js";
+import { syncSecretsToVolume } from "./sidecar.js";
+import { generateEntityId } from "@llm-vault/ids";
 
 const HELP_TEXT = `
 llm-vault - Developer CLI for zero-knowledge secret management and zero-file process injection.
@@ -26,6 +29,8 @@ COMMANDS:
   scan            Scan workspace files or staged changes for unencrypted credentials
   absorb          Migrate hardcoded secrets into vault records and rewrite files to templates
   hook            Manage git pre-commit hooks (install, remove, status)
+  ssh-agent       Manage embedded SSH agent and Git commit signing keys
+  sidecar         Synchronize vault secrets into container volume mounts (tmpfs)
   login           Cache an authentication token and server endpoint in local session store
   logout          Clear active local session cache
   status, whoami  Display active session and connection status
@@ -54,6 +59,12 @@ ABSORB OPTIONS:
 
 HOOK OPTIONS:
   llm-vault hook [status|install|remove]
+
+SSH AGENT OPTIONS:
+  llm-vault ssh-agent [start|status] [--socket <path>] [--approval-mode <auto|interactive|oob>]
+
+SIDECAR OPTIONS:
+  llm-vault sidecar sync [--mount-path <path>] [--file <name:content>]
 
 LOGIN OPTIONS:
   --endpoint <url>    Vault API server URL (e.g. http://localhost:3000)
@@ -437,6 +448,118 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
 
       console.error(
         `Unknown hook action: "${subAction}". Usage: llm-vault hook [status|install|remove]`,
+      );
+      return 1;
+    }
+
+    case "ssh-agent": {
+      const subAction = commandArgs[0];
+      const { values } = parseArgs({
+        args: cliOptionsArgs.slice(1),
+        options: {
+          socket: { type: "string" },
+          "approval-mode": { type: "string" },
+        },
+        allowPositionals: true,
+      });
+
+      if (!subAction || subAction === "status") {
+        const socketPath = values.socket || process.env["SSH_AUTH_SOCK"];
+        if (!socketPath) {
+          console.error(
+            "No socket path specified and SSH_AUTH_SOCK environment variable is unset.",
+          );
+          return 1;
+        }
+
+        try {
+          const identities = await querySshAgentIdentities(socketPath);
+          console.log(`SSH Agent active at: ${socketPath}`);
+          console.log(`Loaded Identities (${identities.length}):`);
+          for (const id of identities) {
+            console.log(`  ${id.fingerprint} ${id.comment} (ED25519)`);
+          }
+          return 0;
+        } catch (err) {
+          console.error(
+            "Failed to query SSH agent status:",
+            err instanceof Error ? err.message : String(err),
+          );
+          return 1;
+        }
+      }
+
+      if (subAction === "start") {
+        const mode = (values["approval-mode"] as ApprovalMode) || "interactive";
+        try {
+          const instance = await startSshAgentServer({
+            socketPath: values.socket,
+            approvalMode: mode,
+          });
+          console.log(`SSH_AUTH_SOCK=${instance.socketPath}; export SSH_AUTH_SOCK;`);
+          console.log(`echo SSH agent started with pid ${process.pid};`);
+          return 0;
+        } catch (err) {
+          console.error(
+            "Failed to start SSH agent server:",
+            err instanceof Error ? err.message : String(err),
+          );
+          return 1;
+        }
+      }
+
+      console.error(
+        `Unknown ssh-agent action: "${subAction}". Usage: llm-vault ssh-agent [start|status]`,
+      );
+      return 1;
+    }
+
+    case "sidecar": {
+      const subAction = commandArgs[0];
+      const { values } = parseArgs({
+        args: cliOptionsArgs.slice(1),
+        options: {
+          "mount-path": { type: "string" },
+          file: { type: "string" },
+        },
+        allowPositionals: true,
+      });
+
+      if (!subAction || subAction === "sync") {
+        const mountPath = values["mount-path"] || "/vault/secrets";
+        const secretsList = [];
+
+        if (values.file) {
+          const firstColon = values.file.indexOf(":");
+          if (firstColon !== -1) {
+            const filename = values.file.slice(0, firstColon);
+            const content = values.file.slice(firstColon + 1);
+            secretsList.push({
+              secretId: generateEntityId("sec_"),
+              outputFilename: filename,
+              content,
+            });
+          }
+        }
+
+        try {
+          const res = await syncSecretsToVolume({
+            mountPath,
+            secrets: secretsList,
+            cleanStaleFiles: false,
+          });
+          console.log(
+            `Sidecar successfully synchronized ${res.syncedCount} secret file(s) into ${mountPath}`,
+          );
+          return 0;
+        } catch (err) {
+          console.error("Sidecar sync failed:", err instanceof Error ? err.message : String(err));
+          return 1;
+        }
+      }
+
+      console.error(
+        `Unknown sidecar action: "${subAction}". Usage: llm-vault sidecar sync [--mount-path <path>] [--file <name:content>]`,
       );
       return 1;
     }

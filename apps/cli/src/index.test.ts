@@ -19,6 +19,19 @@ import { injectTemplate } from "./injector.js";
 import { calculateShannonEntropy, redactSecret, scanContent, scanWorkspace } from "./scanner.js";
 import { absorbFile } from "./absorb.js";
 import { installPreCommitHook, removePreCommitHook, getPreCommitHookStatus } from "./hook.js";
+import {
+  startSshAgentServer,
+  createSshKeyEntry,
+  querySshAgentIdentities,
+  requestSshAgentSignature,
+} from "./ssh-agent.js";
+import { syncSecretsToVolume, startSidecarDaemon } from "./sidecar.js";
+import {
+  generateUserKeyPairs,
+  base64ToBytes,
+  encodeOpenSshEd25519KeyBlob,
+  verifyPayloadSignature,
+} from "@llm-vault/crypto";
 import { main } from "./cli.js";
 
 describe("@llm-vault/cli", () => {
@@ -715,6 +728,191 @@ DEBUG='true'
         } finally {
           console.log = originalLog;
         }
+      });
+    });
+  });
+
+  describe("Slice 10: Embedded SSH Agent & Container Sidecar", () => {
+    describe("SSH Agent Protocol & Ed25519 Commit Signing", () => {
+      it("starts SSH agent, answers identities request, and cryptographically signs data", async () => {
+        const userKeys = await generateUserKeyPairs();
+        const rawPublicBytes = base64ToBytes(userKeys.ed25519.publicKeyBase64);
+
+        const keyEntry = await createSshKeyEntry({
+          comment: "git-commit-signing@llm-vault",
+          publicKeyBytes: rawPublicBytes,
+          privateKey: userKeys.ed25519.privateKey,
+          approvalRequired: false,
+        });
+
+        const agent = await startSshAgentServer({
+          approvalMode: "auto",
+          keys: [keyEntry],
+        });
+
+        try {
+          const status = await agent.getStatus();
+          expect(status.running).toBe(true);
+          expect(status.keyCount).toBe(1);
+          expect(status.keys[0]?.comment).toBe("git-commit-signing@llm-vault");
+          expect(status.keys[0]?.fingerprint).toBe(keyEntry.fingerprint);
+
+          // Query identities over socket
+          const identities = await querySshAgentIdentities(agent.socketPath);
+          expect(identities).toHaveLength(1);
+          expect(identities[0]?.comment).toBe("git-commit-signing@llm-vault");
+          expect(identities[0]?.publicKeyBytes).toEqual(rawPublicBytes);
+
+          // Sign Git commit tree buffer
+          const dataToSign = new TextEncoder().encode(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n",
+          );
+          const keyBlob = encodeOpenSshEd25519KeyBlob(rawPublicBytes);
+          const signature = await requestSshAgentSignature(agent.socketPath, keyBlob, dataToSign);
+
+          expect(signature.length).toBe(64);
+          const verified = await verifyPayloadSignature(
+            userKeys.ed25519.publicKey,
+            dataToSign,
+            signature,
+          );
+          expect(verified).toBe(true);
+        } finally {
+          await agent.stop();
+        }
+      });
+
+      it("enforces OOB interactive approval gate and rejects signature on denial", async () => {
+        const userKeys = await generateUserKeyPairs();
+        const rawPublicBytes = base64ToBytes(userKeys.ed25519.publicKeyBase64);
+
+        const keyEntry = await createSshKeyEntry({
+          comment: "production-deploy@corp",
+          publicKeyBytes: rawPublicBytes,
+          privateKey: userKeys.ed25519.privateKey,
+          approvalRequired: true,
+        });
+
+        let approvalRequested = false;
+        const agent = await startSshAgentServer({
+          approvalMode: "oob",
+          keys: [keyEntry],
+          onApprovalRequest: async (req) => {
+            approvalRequested = true;
+            expect(req.keyComment).toBe("production-deploy@corp");
+            return false; // Denied by human operator
+          },
+        });
+
+        try {
+          const dataToSign = new TextEncoder().encode("git-push-origin-main");
+          const keyBlob = encodeOpenSshEd25519KeyBlob(rawPublicBytes);
+
+          await expect(
+            requestSshAgentSignature(agent.socketPath, keyBlob, dataToSign),
+          ).rejects.toThrow(/SSH agent returned failure/);
+
+          expect(approvalRequested).toBe(true);
+        } finally {
+          await agent.stop();
+        }
+      });
+    });
+
+    describe("Container Sidecar Volume Mount Synchronization", () => {
+      it("synchronizes secret files into volume with atomic write and 0600 permissions", async () => {
+        const mountPath = path.join(tempDir, "vault-secrets");
+        const secrets = [
+          {
+            secretId: generateEntityId("sec_"),
+            outputFilename: "database.env",
+            content: "DATABASE_URL=postgres://user:pass@db:5432/app\n",
+          },
+          {
+            secretId: generateEntityId("sec_"),
+            outputFilename: "tls/api.key",
+            content: "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0B...\n",
+            permissions: "0600",
+          },
+        ];
+
+        const syncResult = await syncSecretsToVolume({
+          mountPath,
+          secrets,
+          inMemoryVolume: true,
+        });
+
+        expect(syncResult.syncedCount).toBe(2);
+        expect(syncResult.writtenFiles).toHaveLength(2);
+
+        const dbFile = path.join(mountPath, "database.env");
+        const keyFile = path.join(mountPath, "tls", "api.key");
+        expect(fs.existsSync(dbFile)).toBe(true);
+        expect(fs.existsSync(keyFile)).toBe(true);
+        expect(fs.readFileSync(dbFile, "utf8")).toBe(
+          "DATABASE_URL=postgres://user:pass@db:5432/app\n",
+        );
+
+        // Cleans up stale files when cleanStaleFiles = true
+        const staleFile = path.join(mountPath, "stale.env");
+        fs.writeFileSync(staleFile, "OLD_SECRET=expired\n");
+
+        const updateResult = await syncSecretsToVolume({
+          mountPath,
+          secrets: [secrets[0]!], // omit second secret
+          cleanStaleFiles: true,
+        });
+
+        expect(updateResult.syncedCount).toBe(1);
+        expect(fs.existsSync(staleFile)).toBe(false);
+      });
+
+      it("starts and stops sidecar daemon with periodic refresh", async () => {
+        const mountPath = path.join(tempDir, "daemon-secrets");
+        let fetchCount = 0;
+
+        const daemon = startSidecarDaemon({
+          mountPath,
+          intervalSeconds: 1,
+          fetchSecrets: async () => {
+            fetchCount++;
+            return [
+              {
+                secretId: generateEntityId("sec_"),
+                outputFilename: "app.conf",
+                content: `REFRESH_COUNT=${fetchCount}\n`,
+              },
+            ];
+          },
+        });
+
+        const syncRes = await daemon.forceSync();
+        expect(syncRes.syncedCount).toBe(1);
+        expect(fetchCount).toBeGreaterThanOrEqual(1);
+
+        const confFile = path.join(mountPath, "app.conf");
+        expect(fs.existsSync(confFile)).toBe(true);
+
+        daemon.stop();
+      });
+    });
+
+    describe("CLI Commands: sidecar", () => {
+      it("executes llm-vault sidecar sync via CLI", async () => {
+        const mountPath = path.join(tempDir, "cli-sidecar");
+        const code = await main([
+          "sidecar",
+          "sync",
+          "--mount-path",
+          mountPath,
+          "--file",
+          "secret.env:API_KEY=test-api-token-value",
+        ]);
+
+        expect(code).toBe(0);
+        const secretFile = path.join(mountPath, "secret.env");
+        expect(fs.existsSync(secretFile)).toBe(true);
+        expect(fs.readFileSync(secretFile, "utf8")).toBe("API_KEY=test-api-token-value");
       });
     });
   });

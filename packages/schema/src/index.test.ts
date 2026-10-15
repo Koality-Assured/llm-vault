@@ -32,6 +32,11 @@ import {
   isMcpAllowedScope,
   postgresSchema,
   sqliteSchema,
+  SshKeyIdentitySchema,
+  SshAgentStatusSchema,
+  K8sEsoSecretSyncRequestSchema,
+  K8sEsoSecretSyncResponseSchema,
+  ContainerSidecarConfigSchema,
 } from "./index.js";
 
 describe("@llm-vault/schema", () => {
@@ -235,5 +240,67 @@ describe("@llm-vault/schema", () => {
       const sqliteTableObj = sqliteSchema[key as keyof typeof sqliteSchema];
       expect(getTableName(pgTableObj)).toBe(getTableName(sqliteTableObj));
     }
+  });
+
+  it("validates Slice 10 schemas: SSH Key identity, Agent status, K8s ESO sync, and Container sidecar config", () => {
+    const sshKey = SshKeyIdentitySchema.parse({
+      id: "sec_01jk1111111111111111111111",
+      publicKeyOpenSsh: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIG5zY2hp... git-signing",
+      comment: "git-signing",
+      fingerprint: "SHA256:abcd1234efgh5678",
+      createdAt: new Date().toISOString(),
+      approvalRequired: true,
+    });
+    expect(sshKey.comment).toBe("git-signing");
+
+    const agentStatus = SshAgentStatusSchema.parse({
+      running: true,
+      socketPath: "/tmp/llm-vault-ssh-agent.sock",
+      keyCount: 1,
+      keys: [sshKey],
+      approvalMode: "interactive",
+    });
+    expect(agentStatus.approvalMode).toBe("interactive");
+
+    const vaultId = generateEntityId("vlt_");
+    const secretId = generateEntityId("sec_");
+    const k8sReq = K8sEsoSecretSyncRequestSchema.parse({
+      vaultId,
+      secretIds: [secretId],
+      targetNamespace: "production",
+    });
+    expect(k8sReq.targetNamespace).toBe("production");
+
+    const k8sRes = K8sEsoSecretSyncResponseSchema.parse({
+      vaultId,
+      syncedAt: new Date().toISOString(),
+      secrets: [
+        {
+          secretId,
+          name: "DATABASE_URL",
+          version: 1,
+          ciphertext: "abcd",
+          iv: "1234",
+          authTag: "5678",
+          aad: "aad_string",
+          updatedAt: new Date().toISOString(),
+        },
+      ],
+    });
+    expect(k8sRes.secrets).toHaveLength(1);
+
+    const sidecarCfg = ContainerSidecarConfigSchema.parse({
+      vaultId,
+      mountPath: "/vault/secrets",
+      refreshIntervalSeconds: 60,
+      inMemoryVolume: true,
+      secrets: [
+        {
+          secretId,
+          outputFilename: "database.env",
+        },
+      ],
+    });
+    expect(sidecarCfg.refreshIntervalSeconds).toBe(60);
   });
 });

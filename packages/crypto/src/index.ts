@@ -2189,3 +2189,229 @@ export async function revokeProviderCredential(
   }
   return { revoked: true };
 }
+
+// ---------------------------------------------------------------------------
+// Slice 10: OpenSSH Ed25519 Wire Encoding & SSH Agent Protocol Wire Serialization
+// ---------------------------------------------------------------------------
+
+export function writeSshWireUint32(value: number): Uint8Array {
+  const buf = new Uint8Array(4);
+  const view = new DataView(buf.buffer, buf.byteOffset, 4);
+  view.setUint32(0, value >>> 0, false);
+  return buf;
+}
+
+export function readSshWireUint32(
+  buf: Uint8Array,
+  offset: number,
+): { value: number; nextOffset: number } {
+  if (offset + 4 > buf.length) {
+    throw new Error(
+      `Buffer underrun reading uint32: need 4 bytes at offset ${offset}, buffer length ${buf.length}`,
+    );
+  }
+  const view = new DataView(buf.buffer, buf.byteOffset + offset, 4);
+  const value = view.getUint32(0, false);
+  return { value, nextOffset: offset + 4 };
+}
+
+export function encodeSshWireString(bytes: Uint8Array | string): Uint8Array {
+  const payload = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+  const out = new Uint8Array(4 + payload.length);
+  const view = new DataView(out.buffer, out.byteOffset, 4);
+  view.setUint32(0, payload.length, false);
+  out.set(payload, 4);
+  return out;
+}
+
+export function readSshWireString(
+  buf: Uint8Array,
+  offset: number,
+): { value: Uint8Array; nextOffset: number } {
+  const { value: length, nextOffset: dataOffset } = readSshWireUint32(buf, offset);
+  if (dataOffset + length > buf.length) {
+    throw new Error(
+      `Buffer underrun reading wire string: length ${length} at offset ${dataOffset}, buffer length ${buf.length}`,
+    );
+  }
+  const value = buf.subarray(dataOffset, dataOffset + length);
+  return { value, nextOffset: dataOffset + length };
+}
+
+export function readSshWireUtf8String(
+  buf: Uint8Array,
+  offset: number,
+): { value: string; nextOffset: number } {
+  const { value: rawBytes, nextOffset } = readSshWireString(buf, offset);
+  return { value: new TextDecoder().decode(rawBytes), nextOffset };
+}
+
+export function encodeOpenSshEd25519KeyBlob(publicKeyBytes: Uint8Array): Uint8Array {
+  if (publicKeyBytes.length !== 32) {
+    throw new Error(
+      `Invalid Ed25519 public key length: expected 32 bytes, got ${publicKeyBytes.length}`,
+    );
+  }
+  const typePart = encodeSshWireString("ssh-ed25519");
+  const keyPart = encodeSshWireString(publicKeyBytes);
+  const combined = new Uint8Array(typePart.length + keyPart.length);
+  combined.set(typePart, 0);
+  combined.set(keyPart, typePart.length);
+  return combined;
+}
+
+export async function computeSshKeyFingerprint(keyBlob: Uint8Array): Promise<string> {
+  const hash = await globalThis.crypto.subtle.digest("SHA-256", toBuffer(keyBlob));
+  const base64 = Buffer.from(hash).toString("base64").replace(/=+$/, "");
+  return `SHA256:${base64}`;
+}
+
+export function formatOpenSshPublicKey(publicKeyBytes: Uint8Array, comment = "llm-vault"): string {
+  const keyBlob = encodeOpenSshEd25519KeyBlob(publicKeyBytes);
+  const base64 = Buffer.from(keyBlob.buffer, keyBlob.byteOffset, keyBlob.byteLength).toString(
+    "base64",
+  );
+  return `ssh-ed25519 ${base64}${comment ? ` ${comment}` : ""}`;
+}
+
+export function parseOpenSshPublicKey(keyStr: string): {
+  keyType: "ssh-ed25519";
+  publicKeyBytes: Uint8Array;
+  comment: string;
+  wireBlob: Uint8Array;
+} {
+  const trimmed = keyStr.trim();
+  const parts = trimmed.split(/\s+/);
+  if (parts.length < 2) {
+    throw new Error(
+      "Invalid OpenSSH public key format: expected at least key-type and base64 blob",
+    );
+  }
+  const [keyType, base64Blob, ...commentParts] = parts;
+  if (!base64Blob || keyType !== "ssh-ed25519") {
+    throw new Error(`Unsupported OpenSSH key type: ${keyType ?? "unknown"}`);
+  }
+  const wireBlob = new Uint8Array(Buffer.from(base64Blob, "base64"));
+  const { value: parsedTypeBytes, nextOffset: offset1 } = readSshWireString(wireBlob, 0);
+  const parsedType = new TextDecoder().decode(parsedTypeBytes);
+  if (parsedType !== "ssh-ed25519") {
+    throw new Error(`Wire blob key type mismatch: expected ssh-ed25519, got ${parsedType}`);
+  }
+  const { value: keyBytes } = readSshWireString(wireBlob, offset1);
+  if (keyBytes.length !== 32) {
+    throw new Error(
+      `Invalid Ed25519 key length in wire blob: expected 32 bytes, got ${keyBytes.length}`,
+    );
+  }
+  const comment = commentParts.join(" ");
+  return {
+    keyType: "ssh-ed25519",
+    publicKeyBytes: keyBytes,
+    comment,
+    wireBlob,
+  };
+}
+
+export const SSH_AGENT_MSG = {
+  SSH_AGENT_FAILURE: 5,
+  SSH_AGENT_SUCCESS: 6,
+  SSH2_AGENTC_REQUEST_IDENTITIES: 11,
+  SSH2_AGENT_IDENTITIES_ANSWER: 12,
+  SSH2_AGENTC_SIGN_REQUEST: 13,
+  SSH2_AGENT_SIGN_RESPONSE: 14,
+  SSH2_AGENTC_ADD_IDENTITY: 17,
+  SSH2_AGENTC_REMOVE_IDENTITY: 18,
+  SSH2_AGENTC_REMOVE_ALL_IDENTITIES: 19,
+} as const;
+
+export function encodeSshAgentPacket(
+  msgType: number,
+  payload: Uint8Array = new Uint8Array(0),
+): Uint8Array {
+  const packetLength = 1 + payload.length;
+  const out = new Uint8Array(4 + packetLength);
+  const view = new DataView(out.buffer, out.byteOffset, 4);
+  view.setUint32(0, packetLength, false);
+  out[4] = msgType;
+  if (payload.length > 0) {
+    out.set(payload, 5);
+  }
+  return out;
+}
+
+export function decodeSshAgentPacket(buffer: Uint8Array): {
+  msgType: number;
+  payload: Uint8Array;
+  packetLength: number;
+} {
+  if (buffer.length < 5) {
+    throw new Error(`Incomplete packet header: buffer has ${buffer.length} bytes, need at least 5`);
+  }
+  const { value: bodyLength } = readSshWireUint32(buffer, 0);
+  const totalLength = 4 + bodyLength;
+  if (buffer.length < totalLength) {
+    throw new Error(`Incomplete packet: expected ${totalLength} bytes, have ${buffer.length}`);
+  }
+  const msgType = buffer[4] ?? 0;
+  const payload = buffer.subarray(5, totalLength);
+  return { msgType, payload, packetLength: totalLength };
+}
+
+export function encodeIdentitiesAnswer(
+  identities: Array<{ publicKeyBytes: Uint8Array; comment?: string | undefined }>,
+): Uint8Array {
+  const countBytes = writeSshWireUint32(identities.length);
+  const parts: Uint8Array[] = [countBytes];
+  let totalLength = 4;
+
+  for (const ident of identities) {
+    const keyBlob = encodeOpenSshEd25519KeyBlob(ident.publicKeyBytes);
+    const keyBlobWire = encodeSshWireString(keyBlob);
+    const commentWire = encodeSshWireString(ident.comment ?? "");
+    parts.push(keyBlobWire, commentWire);
+    totalLength += keyBlobWire.length + commentWire.length;
+  }
+
+  const payload = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const part of parts) {
+    payload.set(part, offset);
+    offset += part.length;
+  }
+
+  return encodeSshAgentPacket(SSH_AGENT_MSG.SSH2_AGENT_IDENTITIES_ANSWER, payload);
+}
+
+export function decodeSignRequest(payload: Uint8Array): {
+  keyBlob: Uint8Array;
+  dataToSign: Uint8Array;
+  flags: number;
+} {
+  const { value: keyBlob, nextOffset: offset1 } = readSshWireString(payload, 0);
+  const { value: dataToSign, nextOffset: offset2 } = readSshWireString(payload, offset1);
+  let flags = 0;
+  if (offset2 < payload.length) {
+    const { value: flagsVal } = readSshWireUint32(payload, offset2);
+    flags = flagsVal;
+  }
+  return { keyBlob, dataToSign, flags };
+}
+
+export function encodeSignResponse(rawSignatureBytes: Uint8Array): Uint8Array {
+  const algoPart = encodeSshWireString("ssh-ed25519");
+  const sigPart = encodeSshWireString(rawSignatureBytes);
+  const sigBlob = new Uint8Array(algoPart.length + sigPart.length);
+  sigBlob.set(algoPart, 0);
+  sigBlob.set(sigPart, algoPart.length);
+
+  const payload = encodeSshWireString(sigBlob);
+  return encodeSshAgentPacket(SSH_AGENT_MSG.SSH2_AGENT_SIGN_RESPONSE, payload);
+}
+
+export function encodeAgentFailure(): Uint8Array {
+  return encodeSshAgentPacket(SSH_AGENT_MSG.SSH_AGENT_FAILURE);
+}
+
+export function encodeAgentSuccess(): Uint8Array {
+  return encodeSshAgentPacket(SSH_AGENT_MSG.SSH_AGENT_SUCCESS);
+}
