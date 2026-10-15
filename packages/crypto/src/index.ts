@@ -1519,15 +1519,53 @@ export function sanitizeImportString(input: string): string {
     }
     cleaned += input[i];
   }
-  // Iteratively strip script tags and HTML markup until fixpoint to prevent nested-tag bypasses
+  // Iteratively strip script/style tags and HTML markup until fixpoint without regexes
   let prev = "";
   while (cleaned !== prev) {
     prev = cleaned;
-    cleaned = cleaned.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
-    cleaned = cleaned.replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "");
-    cleaned = cleaned.replace(/<[^>]+>/g, "");
+    let result = "";
+    let i = 0;
+    while (i < cleaned.length) {
+      if (cleaned[i] === "<") {
+        const rest = cleaned.slice(i).toLowerCase();
+        if (rest.startsWith("<script")) {
+          const closeIdx = rest.indexOf("</script");
+          if (closeIdx !== -1) {
+            const endTagClose = cleaned.indexOf(">", i + closeIdx);
+            if (endTagClose !== -1) {
+              i = endTagClose + 1;
+              continue;
+            }
+          }
+        } else if (rest.startsWith("<style")) {
+          const closeIdx = rest.indexOf("</style");
+          if (closeIdx !== -1) {
+            const endTagClose = cleaned.indexOf(">", i + closeIdx);
+            if (endTagClose !== -1) {
+              i = endTagClose + 1;
+              continue;
+            }
+          }
+        }
+        const tagEnd = cleaned.indexOf(">", i);
+        if (tagEnd !== -1) {
+          i = tagEnd + 1;
+          continue;
+        }
+        // Stray '<' without '>'
+        i++;
+        continue;
+      }
+      if (cleaned[i] === ">") {
+        // Stray '>'
+        i++;
+        continue;
+      }
+      result += cleaned[i];
+      i++;
+    }
+    cleaned = result;
   }
-  cleaned = cleaned.replace(/[<>]/g, "");
 
   return cleaned.trim();
 }
