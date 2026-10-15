@@ -12,7 +12,11 @@ interface ReplacementRule {
 const textDecoder = new TextDecoder();
 
 function stripBase64Padding(value: string): string {
-  return value.replace(/=+$/, "");
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 0x3d) {
+    end--;
+  }
+  return value.slice(0, end);
 }
 
 /**
