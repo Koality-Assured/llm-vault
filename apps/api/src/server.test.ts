@@ -2232,4 +2232,176 @@ describe("Fastify REST API server (apps/api)", () => {
       expect(updatedSec.json().version).toBe(2);
     });
   });
+
+  describe("Slice 10: Kubernetes External Secrets Operator (ESO) Integration", () => {
+    let s10App: FastifyInstance;
+    let s10Token: string;
+    let s10VaultId: string;
+    let s10SecretId1: string;
+    let s10SecretId2: string;
+
+    beforeAll(async () => {
+      const sqlite = new Database(":memory:");
+      initSchema(sqlite);
+      const db = drizzle(sqlite, { schema: sqliteSchema });
+      const s10Db: VaultDatabase = { db, sqlite, path: ":memory:" };
+      s10App = buildServer({ database: s10Db, deploymentMode: "standalone" });
+      await s10App.ready();
+
+      // Register standalone admin
+      const authRes = await s10App.inject({
+        method: "POST",
+        url: "/api/v1/auth/bootstrap",
+        payload: {
+          email: "slice10_admin@standalone.local",
+          displayName: "Slice 10 Admin",
+          clientAuthKeyHex: "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+          kdfSalt: "test_salt_32_bytes_long_value__",
+          kdfIterations: 600000,
+          x25519PublicKey: "base64_x25519_pk",
+          ed25519PublicKey: "base64_ed25519_pk",
+          publicKeyFingerprint: "fp_test_slice10",
+          encryptedX25519PrivateKey: "enc_priv_key",
+          encryptedEd25519PrivateKey: "enc_ed_priv_key",
+        },
+      });
+      expect(authRes.statusCode).toBe(201);
+      s10Token = authRes.json().sessionToken;
+
+      // Create vault
+      const vRes = await s10App.inject({
+        method: "POST",
+        url: "/api/v1/vaults",
+        headers: { authorization: `Bearer ${s10Token}` },
+        payload: {
+          name: "K8s ESO Sync Vault",
+          description: "Vault for Kubernetes External Secrets Operator",
+          encryptedVaultKey: {
+            ciphertext: "enc_vault_key",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_vault_key",
+          },
+        },
+      });
+      expect(vRes.statusCode).toBe(201);
+      s10VaultId = vRes.json().id;
+
+      // Create secret 1
+      s10SecretId1 = generateEntityId("sec_");
+      await s10App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s10VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s10Token}` },
+        payload: {
+          id: s10SecretId1,
+          vaultId: s10VaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            ciphertext: "enc_meta_1",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_meta_1",
+          },
+          encryptedPayload: {
+            ciphertext: "enc_payload_1",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_payload_1",
+          },
+          tagBlindIndexes: [],
+        },
+      });
+
+      // Create secret 2
+      s10SecretId2 = generateEntityId("sec_");
+      await s10App.inject({
+        method: "POST",
+        url: `/api/v1/vaults/${s10VaultId}/secrets`,
+        headers: { authorization: `Bearer ${s10Token}` },
+        payload: {
+          id: s10SecretId2,
+          vaultId: s10VaultId,
+          version: 1,
+          keyVersion: 1,
+          encryptedMetadata: {
+            ciphertext: "enc_meta_2",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_meta_2",
+          },
+          encryptedPayload: {
+            ciphertext: "enc_payload_2",
+            iv: "iv_123456789012",
+            authTag: "tag_1234567890123456",
+            aad: "aad_payload_2",
+          },
+          tagBlindIndexes: [],
+        },
+      });
+    });
+
+    afterAll(async () => {
+      await s10App.close();
+    });
+
+    it("POST /api/v1/integrations/k8s-eso/secrets returns encrypted payloads for all secrets in vault", async () => {
+      const syncRes = await s10App.inject({
+        method: "POST",
+        url: "/api/v1/integrations/k8s-eso/secrets",
+        headers: { authorization: `Bearer ${s10Token}` },
+        payload: {
+          vaultId: s10VaultId,
+          targetNamespace: "kube-system",
+        },
+      });
+
+      expect(syncRes.statusCode).toBe(200);
+      const data = syncRes.json();
+      expect(data.vaultId).toBe(s10VaultId);
+      expect(data.syncedAt).toBeDefined();
+      expect(data.secrets).toHaveLength(2);
+      expect(data.secrets[0].ciphertext).toBeDefined();
+      expect(data.secrets[0].iv).toBeDefined();
+      expect(data.secrets[0].authTag).toBeDefined();
+    });
+
+    it("POST /api/v1/integrations/k8s-eso/secrets filters secrets when secretIds are provided", async () => {
+      const syncRes = await s10App.inject({
+        method: "POST",
+        url: "/api/v1/integrations/k8s-eso/secrets",
+        headers: { authorization: `Bearer ${s10Token}` },
+        payload: {
+          vaultId: s10VaultId,
+          secretIds: [s10SecretId1],
+          targetNamespace: "staging",
+        },
+      });
+
+      expect(syncRes.statusCode).toBe(200);
+      const data = syncRes.json();
+      expect(data.secrets).toHaveLength(1);
+      expect(data.secrets[0].secretId).toBe(s10SecretId1);
+    });
+
+    it("POST /api/v1/integrations/k8s-eso/secrets rejects unauthorized or malformed requests", async () => {
+      // 401 without auth header
+      const noAuthRes = await s10App.inject({
+        method: "POST",
+        url: "/api/v1/integrations/k8s-eso/secrets",
+        payload: { vaultId: s10VaultId },
+      });
+      expect(noAuthRes.statusCode).toBe(401);
+
+      // 400 with invalid payload format
+      const badReqRes = await s10App.inject({
+        method: "POST",
+        url: "/api/v1/integrations/k8s-eso/secrets",
+        headers: { authorization: `Bearer ${s10Token}` },
+        payload: { vaultId: "not-a-valid-vlt-id" },
+      });
+      expect(badReqRes.statusCode).toBe(400);
+    });
+  });
 });

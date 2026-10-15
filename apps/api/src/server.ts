@@ -23,6 +23,7 @@ import {
   WorkloadIdentityExchangeRequestSchema,
   ConfigureRotationRequestSchema,
   RotateSecretRequestSchema,
+  K8sEsoSecretSyncRequestSchema,
   isMcpAllowedScope,
   type PermissionScope,
   type SystemRole,
@@ -3982,6 +3983,98 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       rotated: rotatedCount,
       failed: failedCount,
       results,
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Slice 10: Kubernetes External Secrets Operator (ESO) Webhook Integration
+  // ---------------------------------------------------------------------------
+  app.post("/api/v1/integrations/k8s-eso/secrets", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "secrets:read", reply);
+
+    const parsed = K8sEsoSecretSyncRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid K8s ESO secret sync request format.",
+        details: parsed.error.issues,
+      });
+    }
+
+    const { vaultId, secretIds, targetNamespace } = parsed.data;
+
+    // Check membership / access to the vault
+    const member = database.db
+      .select()
+      .from(vaultMemberKeys)
+      .where(
+        and(
+          eq(vaultMemberKeys.tenantId, caller.tenantId),
+          eq(vaultMemberKeys.vaultId, vaultId),
+          eq(vaultMemberKeys.userId, caller.actorId),
+        ),
+      )
+      .all()[0];
+
+    if (!member && caller.systemRole !== "SuperAdmin") {
+      return reply
+        .status(403)
+        .send({ error: "Access denied: Caller is not a member of this vault." });
+    }
+
+    // Query vault secrets
+    let vaultSecrets = database.db
+      .select()
+      .from(secrets)
+      .where(and(eq(secrets.tenantId, caller.tenantId), eq(secrets.vaultId, vaultId)))
+      .all();
+
+    if (secretIds && secretIds.length > 0) {
+      const allowedSet = new Set(secretIds);
+      vaultSecrets = vaultSecrets.filter((s) => allowedSet.has(s.id));
+    }
+
+    const syncItems = [];
+    for (const sec of vaultSecrets) {
+      const versionList = database.db
+        .select()
+        .from(secretVersions)
+        .where(
+          and(eq(secretVersions.secretId, sec.id), eq(secretVersions.version, sec.currentVersion)),
+        )
+        .all();
+      const currentVer = versionList[0];
+      if (currentVer) {
+        syncItems.push({
+          secretId: sec.id,
+          version: sec.currentVersion,
+          ciphertext: currentVer.encryptedPayload,
+          iv: currentVer.payloadIv,
+          authTag: currentVer.payloadAuthTag,
+          aad: currentVer.payloadAad,
+          updatedAt: sec.updatedAt,
+        });
+      }
+    }
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "integrations:k8s_eso_sync",
+      vaultId,
+      request.ip,
+      {
+        syncedCount: syncItems.length,
+        targetNamespace: targetNamespace ?? "default",
+      },
+    );
+
+    return reply.send({
+      vaultId,
+      syncedAt: new Date().toISOString(),
+      secrets: syncItems,
     });
   });
 
