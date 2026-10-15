@@ -106,3 +106,140 @@ export function ensureDefaultStandaloneTenant(database: VaultDatabase): string {
 
   return tenantId;
 }
+
+export function ensureDefaultEnterpriseTenant(
+  database: VaultDatabase,
+  slug: string = "default",
+  name: string = "Enterprise Organization",
+): string {
+  const existing = database.db.select().from(tenants).where(eq(tenants.slug, slug)).all();
+  if (existing.length > 0 && existing[0]?.id) {
+    return existing[0].id;
+  }
+
+  const tenantId = `tnt_${crypto.randomBytes(12).toString("hex")}`;
+  const now = new Date().toISOString();
+  database.db
+    .insert(tenants)
+    .values({
+      id: tenantId,
+      name,
+      slug,
+      deploymentMode: "enterprise",
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+
+  return tenantId;
+}
+
+export interface OidcClaims {
+  sub: string;
+  email: string;
+  name?: string | undefined;
+  tenantId?: string | undefined;
+}
+
+export interface PendingOidcAuth {
+  codeChallenge: string;
+  claims: OidcClaims;
+  expiresAt: number;
+}
+
+const mockOidcStore = new Map<string, PendingOidcAuth>();
+
+export function createMockOidcAuthorization(
+  claims: OidcClaims,
+  codeChallenge: string,
+  ttlMs: number = 300_000,
+): { code: string; state: string } {
+  const code = `oidc_code_${crypto.randomBytes(24).toString("hex")}`;
+  const state = crypto.randomBytes(16).toString("hex");
+  mockOidcStore.set(code, {
+    codeChallenge,
+    claims,
+    expiresAt: Date.now() + ttlMs,
+  });
+  return { code, state };
+}
+
+export function exchangeMockOidcCode(code: string, codeVerifier: string): OidcClaims {
+  const pending = mockOidcStore.get(code);
+  if (!pending) {
+    throw new Error("Invalid or expired OIDC authorization code");
+  }
+  if (Date.now() > pending.expiresAt) {
+    mockOidcStore.delete(code);
+    throw new Error("OIDC authorization code has expired");
+  }
+
+  const expectedChallenge = crypto.createHash("sha256").update(codeVerifier).digest("base64url");
+  if (expectedChallenge !== pending.codeChallenge) {
+    throw new Error("OIDC PKCE code_verifier challenge mismatch");
+  }
+
+  mockOidcStore.delete(code);
+  return pending.claims;
+}
+
+export function createMockSamlResponseXml(claims: {
+  email: string;
+  name?: string;
+  sub: string;
+  issuer?: string;
+  inResponseTo?: string;
+}): string {
+  const now = new Date().toISOString();
+  const issuer = claims.issuer ?? "https://mock-idp.llm-vault.local";
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_saml_${crypto.randomBytes(16).toString("hex")}" IssueInstant="${now}" Destination="http://localhost:8443/api/v1/auth/saml/callback">
+  <saml:Issuer>${issuer}</saml:Issuer>
+  <samlp:Status>
+    <samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/>
+  </samlp:Status>
+  <saml:Assertion ID="_assert_${crypto.randomBytes(16).toString("hex")}" IssueInstant="${now}" Version="2.0">
+    <saml:Issuer>${issuer}</saml:Issuer>
+    <saml:Subject>
+      <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">${claims.email}</saml:NameID>
+    </saml:Subject>
+    <saml:AttributeStatement>
+      <saml:Attribute Name="email"><saml:AttributeValue>${claims.email}</saml:AttributeValue></saml:Attribute>
+      <saml:Attribute Name="displayName"><saml:AttributeValue>${claims.name ?? "SAML User"}</saml:AttributeValue></saml:Attribute>
+      <saml:Attribute Name="sub"><saml:AttributeValue>${claims.sub}</saml:AttributeValue></saml:Attribute>
+    </saml:AttributeStatement>
+  </saml:Assertion>
+</samlp:Response>`;
+}
+
+export function parseMockSamlResponse(samlResponseBase64: string): {
+  email: string;
+  name: string;
+  sub: string;
+} {
+  const xml = Buffer.from(samlResponseBase64, "base64").toString("utf8");
+  if (!xml.includes("samlp:Response") || !xml.includes("Success")) {
+    throw new Error("Invalid SAML response or non-success status");
+  }
+
+  const nameIdMatch = xml.match(/<saml:NameID[^>]*>([^<]+)<\/saml:NameID>/i);
+  const emailAttrMatch = xml.match(
+    /Name="email"[^>]*>[\s\S]*?<saml:AttributeValue>([^<]+)<\/saml:AttributeValue>/i,
+  );
+  const email = (emailAttrMatch?.[1] ?? nameIdMatch?.[1] ?? "").trim();
+  if (!email) {
+    throw new Error("SAML response does not contain a valid email address");
+  }
+
+  const nameAttrMatch = xml.match(
+    /Name="displayName"[^>]*>[\s\S]*?<saml:AttributeValue>([^<]+)<\/saml:AttributeValue>/i,
+  );
+  const name = (nameAttrMatch?.[1] ?? email.split("@")[0] ?? "SAML User").trim();
+
+  const subAttrMatch = xml.match(
+    /Name="sub"[^>]*>[\s\S]*?<saml:AttributeValue>([^<]+)<\/saml:AttributeValue>/i,
+  );
+  const sub = (subAttrMatch?.[1] ?? email).trim();
+
+  return { email, name, sub };
+}

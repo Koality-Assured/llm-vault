@@ -254,3 +254,89 @@ export const AuditEventSchema = z.object({
   timestamp: z.string().datetime(),
 });
 export type AuditEvent = z.infer<typeof AuditEventSchema>;
+
+export const ShareVaultMemberRequestSchema = z.object({
+  userId: UserIdSchema,
+  vaultRole: VaultRoleSchema,
+  encryptedVaultKey: z.object({
+    ciphertext: z.string().min(1),
+    iv: z.string().min(16),
+    authTag: z.string().min(20),
+    aad: z.string().min(1),
+    keyVersion: z.number().int().min(1),
+  }),
+});
+export type ShareVaultMemberRequest = z.infer<typeof ShareVaultMemberRequestSchema>;
+
+export const RotateVaultKeyRequestSchema = z.object({
+  newKeyVersion: z.number().int().min(2),
+  memberKeys: z
+    .array(
+      z.object({
+        userId: UserIdSchema,
+        encryptedVaultKey: z.string().min(1),
+        iv: z.string().min(16),
+        authTag: z.string().min(20),
+        aad: z.string().min(1),
+      }),
+    )
+    .min(1),
+  agentKeys: z
+    .array(
+      z.object({
+        agentId: AgentIdSchema,
+        agentEncryptedVaultKey: z.string().min(1),
+        iv: z.string().min(16),
+        authTag: z.string().min(20),
+        aad: z.string().min(1),
+      }),
+    )
+    .optional(),
+  reencryptedSecrets: z
+    .array(
+      z.object({
+        secretId: SecretIdSchema,
+        encryptedPayload: z.string().min(1),
+        payloadIv: z.string().min(16),
+        payloadAuthTag: z.string().min(20),
+        payloadAad: z.string().min(1),
+      }),
+    )
+    .optional(),
+});
+export type RotateVaultKeyRequest = z.infer<typeof RotateVaultKeyRequestSchema>;
+
+export const BreakGlassLoginRequestSchema = z.object({
+  email: z.string().email(),
+  clientAuthKeyHex: z.string().min(1),
+  totpCode: z.string().length(6),
+  reason: z.string().min(5),
+});
+export type BreakGlassLoginRequest = z.infer<typeof BreakGlassLoginRequestSchema>;
+
+export const OidcCallbackRequestSchema = z.object({
+  code: z.string().min(1),
+  codeVerifier: z.string().min(1),
+  state: z.string().min(1),
+  tenantId: z.string().optional(),
+});
+export type OidcCallbackRequest = z.infer<typeof OidcCallbackRequestSchema>;
+
+export const SamlCallbackRequestSchema = z.object({
+  samlResponse: z.string().min(1),
+  relayState: z.string().optional(),
+  tenantId: z.string().optional(),
+});
+export type SamlCallbackRequest = z.infer<typeof SamlCallbackRequestSchema>;
+
+export const CreateTenantRequestSchema = z.object({
+  name: z.string().min(1).max(256),
+  slug: z
+    .string()
+    .min(2)
+    .max(64)
+    .regex(/^[a-z0-9-]+$/),
+  deploymentMode: DeploymentModeSchema.default("enterprise"),
+  orgRecoveryPublicKey: z.string().optional(),
+});
+export type CreateTenantRequest = z.infer<typeof CreateTenantRequestSchema>;

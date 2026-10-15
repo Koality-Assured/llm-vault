@@ -232,6 +232,57 @@ export async function deriveMasterSubkeys(
   }
 }
 
+export async function deriveMasterSubkeysFromPrf(
+  prfBytes: Uint8Array,
+  salt: Uint8Array,
+): Promise<DerivedMasterSubkeys> {
+  if (prfBytes.byteLength < 32) {
+    throw new RangeError(
+      `WebAuthn PRF output must be at least 32 bytes, received ${prfBytes.byteLength}`,
+    );
+  }
+  assertSalt(salt);
+
+  const hkdfKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    toBuffer(prfBytes),
+    "HKDF",
+    false,
+    ["deriveKey", "deriveBits"],
+  );
+
+  const masterEncryptionKey = await globalThis.crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: toBuffer(salt),
+      info: toBuffer(textEncoder.encode(HKDF_INFO_MASTER_ENCRYPTION_KEY)),
+    },
+    hkdfKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt", "wrapKey", "unwrapKey"],
+  );
+
+  const clientAuthBits = await globalThis.crypto.subtle.deriveBits(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: toBuffer(salt),
+      info: toBuffer(textEncoder.encode(HKDF_INFO_CLIENT_AUTH_KEY)),
+    },
+    hkdfKey,
+    256,
+  );
+
+  const clientAuthKey = new Uint8Array(clientAuthBits);
+  return {
+    masterEncryptionKey,
+    clientAuthKey,
+    clientAuthKeyHex: bytesToHex(clientAuthKey),
+  };
+}
+
 export interface CanonicalAadContext {
   tenantId: string;
   vaultId: string;
@@ -1085,4 +1136,134 @@ export async function verifyAuditHashChain(
   }
 
   return { valid: true };
+}
+
+const RFC4648_BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+export function bytesToBase32(bytes: Uint8Array): string {
+  let bits = 0;
+  let value = 0;
+  let output = "";
+
+  for (let i = 0; i < bytes.length; i++) {
+    value = (value << 8) | bytes[i]!;
+    bits += 8;
+    while (bits >= 5) {
+      output += RFC4648_BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+  }
+
+  if (bits > 0) {
+    output += RFC4648_BASE32_ALPHABET[(value << (5 - bits)) & 31];
+  }
+
+  return output;
+}
+
+export function base32ToBytes(b32: string): Uint8Array {
+  const cleaned = b32.toUpperCase().replace(/[=\s]/g, "");
+  let bits = 0;
+  let value = 0;
+  const out: number[] = [];
+
+  for (let i = 0; i < cleaned.length; i++) {
+    const idx = RFC4648_BASE32_ALPHABET.indexOf(cleaned[i]!);
+    if (idx === -1) {
+      throw new Error(`Invalid Base32 character: ${cleaned[i]}`);
+    }
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 255);
+      bits -= 8;
+    }
+  }
+
+  return new Uint8Array(out);
+}
+
+export function generateTotpSecret(byteLength: number = 20): {
+  secretBytes: Uint8Array;
+  secretBase32: string;
+} {
+  const secretBytes = new Uint8Array(byteLength);
+  globalThis.crypto.getRandomValues(secretBytes);
+  const secretBase32 = bytesToBase32(secretBytes);
+  return { secretBytes, secretBase32 };
+}
+
+export async function generateTotpCode(
+  secret: string | Uint8Array,
+  timestampMs: number = Date.now(),
+  stepSeconds: number = 30,
+  digits: number = 6,
+): Promise<string> {
+  const secretBytes = typeof secret === "string" ? base32ToBytes(secret) : secret;
+  const counter = Math.floor(timestampMs / 1000 / stepSeconds);
+
+  const counterBuffer = new ArrayBuffer(8);
+  const view = new DataView(counterBuffer);
+  view.setBigUint64(0, BigInt(counter));
+
+  const hmacKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    toBuffer(secretBytes),
+    { name: "HMAC", hash: "SHA-1" },
+    false,
+    ["sign"],
+  );
+
+  const signature = new Uint8Array(
+    await globalThis.crypto.subtle.sign("HMAC", hmacKey, counterBuffer),
+  );
+  const offset = signature[signature.length - 1]! & 0x0f;
+  const binary =
+    ((signature[offset]! & 0x7f) << 24) |
+    ((signature[offset + 1]! & 0xff) << 16) |
+    ((signature[offset + 2]! & 0xff) << 8) |
+    (signature[offset + 3]! & 0xff);
+
+  const otp = binary % 10 ** digits;
+  return otp.toString().padStart(digits, "0");
+}
+
+function cryptoTimingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+export async function verifyTotpCode(
+  code: string,
+  secret: string | Uint8Array,
+  options?: {
+    window?: number;
+    timestampMs?: number;
+    stepSeconds?: number;
+    digits?: number;
+  },
+): Promise<boolean> {
+  const trimmed = code.trim();
+  const digits = options?.digits ?? 6;
+  if (trimmed.length !== digits || !/^\d+$/.test(trimmed)) {
+    return false;
+  }
+
+  const window = options?.window ?? 1;
+  const timestampMs = options?.timestampMs ?? Date.now();
+  const stepSeconds = options?.stepSeconds ?? 30;
+
+  for (let i = -window; i <= window; i++) {
+    const checkTime = timestampMs + i * stepSeconds * 1000;
+    const generated = await generateTotpCode(secret, checkTime, stepSeconds, digits);
+    if (cryptoTimingSafeEqual(trimmed, generated)) {
+      return true;
+    }
+  }
+
+  return false;
 }

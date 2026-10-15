@@ -33,6 +33,7 @@ export const users = pgTable(
     publicKeyFingerprint: text("public_key_fingerprint").notNull(),
     encryptedX25519PrivateKey: text("encrypted_x25519_private_key").notNull(),
     encryptedEd25519PrivateKey: text("encrypted_ed25519_private_key").notNull(),
+    totpSecret: text("totp_secret"),
     isBreakGlassAdmin: boolean("is_break_glass_admin").notNull().default(false),
     status: text("status").notNull().default("active"),
     createdAt: text("created_at").notNull(),

@@ -33,6 +33,7 @@ export const users = sqliteTable(
     publicKeyFingerprint: text("public_key_fingerprint").notNull(),
     encryptedX25519PrivateKey: text("encrypted_x25519_private_key").notNull(),
     encryptedEd25519PrivateKey: text("encrypted_ed25519_private_key").notNull(),
+    totpSecret: text("totp_secret"),
     isBreakGlassAdmin: integer("is_break_glass_admin", { mode: "boolean" })
       .notNull()
       .default(false),

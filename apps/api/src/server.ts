@@ -22,12 +22,18 @@ import {
 } from "@llm-vault/schema/db/sqlite";
 import {
   authenticateRequest,
+  createMockOidcAuthorization,
+  ensureDefaultEnterpriseTenant,
   ensureDefaultStandaloneTenant,
+  exchangeMockOidcCode,
   hashAgentToken,
   hashServerPassword,
   issueSessionToken,
+  parseMockSamlResponse,
   type AuthenticatedCaller,
+  type OidcClaims,
 } from "./auth.js";
+import { verifyTotpCode } from "@llm-vault/crypto";
 import { createDatabase, type VaultDatabase } from "./db.js";
 
 declare module "fastify" {
@@ -40,11 +46,19 @@ export interface BuildServerOptions {
   database?: VaultDatabase;
   dbPath?: string;
   enableCors?: boolean;
+  deploymentMode?: "enterprise" | "standalone";
 }
 
 export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   const database = options.database ?? createDatabase(options.dbPath);
-  ensureDefaultStandaloneTenant(database);
+  const deploymentMode =
+    options.deploymentMode ??
+    (process.env["DEPLOYMENT_MODE"] === "enterprise" ? "enterprise" : "standalone");
+  if (deploymentMode === "enterprise") {
+    ensureDefaultEnterpriseTenant(database);
+  } else {
+    ensureDefaultStandaloneTenant(database);
+  }
 
   const app = fastify({
     logger: false,
@@ -155,14 +169,97 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
   });
 
   app.get("/api/v1/status", async () => {
-    const tenantsList = database.db.select().from(tenants).all();
-    const deploymentMode = tenantsList[0]?.deploymentMode ?? "standalone";
     return {
       status: "ok",
       deploymentMode,
       serverTime: new Date().toISOString(),
       version: "0.1.0",
     };
+  });
+
+  // -------------------------------------------------------------------------
+  // Tenant Routes
+  // -------------------------------------------------------------------------
+
+  app.post("/api/v1/tenants", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    if (caller.systemRole !== "SuperAdmin") {
+      return reply.status(403).send({ error: "Forbidden: SuperAdmin required to create tenants." });
+    }
+
+    const body = request.body as {
+      name: string;
+      slug: string;
+      deploymentMode?: "enterprise" | "standalone";
+      orgRecoveryPublicKey?: string;
+    };
+
+    if (!body.name || !body.slug) {
+      return reply.status(400).send({ error: "name and slug are required." });
+    }
+
+    const tenantId = `tnt_${crypto.randomBytes(12).toString("hex")}`;
+    const now = new Date().toISOString();
+    database.db
+      .insert(tenants)
+      .values({
+        id: tenantId,
+        name: body.name.trim(),
+        slug: body.slug.toLowerCase().trim(),
+        deploymentMode: body.deploymentMode ?? "enterprise",
+        orgRecoveryPublicKey: body.orgRecoveryPublicKey,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+
+    recordAudit(
+      tenantId,
+      null,
+      caller.actorId,
+      caller.actorType,
+      "admin:users:manage",
+      tenantId,
+      request.ip,
+      { action: "create_tenant", slug: body.slug },
+    );
+
+    return reply.status(201).send({
+      id: tenantId,
+      name: body.name.trim(),
+      slug: body.slug.toLowerCase().trim(),
+      deploymentMode: body.deploymentMode ?? "enterprise",
+      createdAt: now,
+    });
+  });
+
+  app.get("/api/v1/tenants", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    if (caller.systemRole === "SuperAdmin") {
+      const allTenants = database.db.select().from(tenants).all();
+      return reply.send({ tenants: allTenants });
+    }
+    const tenantList = database.db
+      .select()
+      .from(tenants)
+      .where(eq(tenants.id, caller.tenantId))
+      .all();
+    return reply.send({ tenants: tenantList });
+  });
+
+  app.get("/api/v1/tenants/:id", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    const { id } = request.params as { id: string };
+    if (caller.systemRole !== "SuperAdmin" && caller.tenantId !== id) {
+      return reply.status(403).send({ error: "Forbidden: Access to tenant denied." });
+    }
+
+    const tenantList = database.db.select().from(tenants).where(eq(tenants.id, id)).all();
+    const tenant = tenantList[0];
+    if (!tenant) {
+      return reply.status(404).send({ error: `Tenant ${id} not found.` });
+    }
+    return reply.send({ tenant });
   });
 
   // -------------------------------------------------------------------------
@@ -186,13 +283,18 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       publicKeyFingerprint: string;
       encryptedX25519PrivateKey: string;
       encryptedEd25519PrivateKey: string;
+      isBreakGlassAdmin?: boolean;
+      totpSecret?: string;
     };
 
     if (!body.email || !body.clientAuthKeyHex || !body.kdfSalt) {
       return reply.status(400).send({ error: "Missing required bootstrap parameters." });
     }
 
-    const tenantId = ensureDefaultStandaloneTenant(database);
+    const tenantId =
+      deploymentMode === "enterprise"
+        ? ensureDefaultEnterpriseTenant(database)
+        : ensureDefaultStandaloneTenant(database);
     const userId = generateEntityId("usr_");
     const serverPasswordHash = hashServerPassword(body.clientAuthKeyHex, body.kdfSalt);
     const now = new Date().toISOString();
@@ -214,7 +316,8 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         publicKeyFingerprint: body.publicKeyFingerprint,
         encryptedX25519PrivateKey: body.encryptedX25519PrivateKey,
         encryptedEd25519PrivateKey: body.encryptedEd25519PrivateKey,
-        isBreakGlassAdmin: true,
+        totpSecret: body.totpSecret,
+        isBreakGlassAdmin: body.isBreakGlassAdmin ?? true,
         status: "active",
         createdAt: now,
         updatedAt: now,
@@ -236,11 +339,18 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       userId,
       tenantId,
       sessionToken: token,
-      message: "Standalone vault bootstrap successful.",
+      message: "Vault bootstrap successful.",
     });
   });
 
-  app.post("/api/v1/auth/login", async (request, reply) => {
+  const handlePasswordLogin = async (request: FastifyRequest, reply: FastifyReply) => {
+    if (deploymentMode === "enterprise") {
+      return reply.status(403).send({
+        error:
+          "Direct password authentication is disabled in enterprise mode. Use OIDC/SAML SSO or break-glass authentication.",
+      });
+    }
+
     const body = request.body as {
       email: string;
       clientAuthKeyHex: string;
@@ -287,6 +397,302 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
       publicKeyFingerprint: user.publicKeyFingerprint,
       encryptedX25519PrivateKey: user.encryptedX25519PrivateKey,
       sessionToken: token,
+    });
+  };
+
+  app.post("/api/v1/auth/login", handlePasswordLogin);
+  app.post("/api/v1/auth/standalone/login", handlePasswordLogin);
+
+  // -------------------------------------------------------------------------
+  // Enterprise SSO Routes (OIDC PKCE & SAML 2.0)
+  // -------------------------------------------------------------------------
+
+  app.post("/api/v1/auth/oidc/authorize", async (request, reply) => {
+    const body = request.body as {
+      email: string;
+      name?: string;
+      tenantId?: string;
+      codeChallenge: string;
+    };
+
+    if (!body.email || !body.codeChallenge) {
+      return reply.status(400).send({ error: "email and codeChallenge are required." });
+    }
+
+    const tenantId = body.tenantId ?? database.db.select().from(tenants).all()[0]?.id ?? "default";
+
+    const { code, state } = createMockOidcAuthorization(
+      {
+        sub: `oidc_sub_${crypto.randomBytes(8).toString("hex")}`,
+        email: body.email.toLowerCase().trim(),
+        name: body.name ?? body.email.split("@")[0],
+        tenantId,
+      },
+      body.codeChallenge,
+    );
+
+    return reply.send({
+      code,
+      state,
+      redirectUri: "/api/v1/auth/oidc/callback",
+    });
+  });
+
+  app.post("/api/v1/auth/oidc/callback", async (request, reply) => {
+    const body = request.body as {
+      code: string;
+      codeVerifier: string;
+      state?: string;
+      tenantId?: string;
+    };
+
+    if (!body.code || !body.codeVerifier) {
+      return reply.status(400).send({ error: "code and codeVerifier are required." });
+    }
+
+    let claims: OidcClaims;
+    try {
+      claims = exchangeMockOidcCode(body.code, body.codeVerifier);
+    } catch (err: unknown) {
+      return reply.status(401).send({ error: (err as Error).message });
+    }
+
+    const tenantId =
+      body.tenantId ??
+      claims.tenantId ??
+      database.db.select().from(tenants).all()[0]?.id ??
+      "default";
+
+    const userList = database.db
+      .select()
+      .from(users)
+      .where(and(eq(users.email, claims.email.toLowerCase().trim()), eq(users.tenantId, tenantId)))
+      .all();
+
+    let user = userList[0];
+    const now = new Date().toISOString();
+
+    if (!user) {
+      const userId = generateEntityId("usr_");
+      database.db
+        .insert(users)
+        .values({
+          id: userId,
+          tenantId,
+          email: claims.email.toLowerCase().trim(),
+          displayName: claims.name ?? claims.email.split("@")[0] ?? "SSO User",
+          systemRole: "SecretConsumer",
+          kdfAlgorithm: "PBKDF2-HMAC-SHA256",
+          kdfSalt: crypto.randomBytes(32).toString("hex"),
+          kdfIterations: 600000,
+          x25519PublicKey: "",
+          ed25519PublicKey: "",
+          publicKeyFingerprint: "",
+          encryptedX25519PrivateKey: "",
+          encryptedEd25519PrivateKey: "",
+          isBreakGlassAdmin: false,
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+      user = database.db.select().from(users).where(eq(users.id, userId)).all()[0]!;
+    }
+
+    const caller: AuthenticatedCaller = {
+      actorId: user.id,
+      actorType: "user",
+      tenantId: user.tenantId,
+      email: user.email,
+      displayName: user.displayName,
+      systemRole: user.systemRole,
+      scopes: Object.values(VAULT_ROLE_PERMISSIONS.SecretConsumer),
+    };
+
+    const token = issueSessionToken(caller);
+    recordAudit(tenantId, null, user.id, "user", "secrets:read", user.id, request.ip, {
+      method: "oidc_pkce",
+      sub: claims.sub,
+    });
+
+    return reply.send({
+      userId: user.id,
+      tenantId: user.tenantId,
+      email: user.email,
+      displayName: user.displayName,
+      systemRole: user.systemRole,
+      kdfSalt: user.kdfSalt,
+      kdfIterations: user.kdfIterations,
+      publicKeyFingerprint: user.publicKeyFingerprint,
+      encryptedX25519PrivateKey: user.encryptedX25519PrivateKey,
+      sessionToken: token,
+      unlockRequired: true,
+    });
+  });
+
+  app.post("/api/v1/auth/saml/login", async (request, reply) => {
+    const body = (request.body ?? {}) as { tenantId?: string; relayState?: string };
+    const relayState = body.relayState ?? crypto.randomBytes(16).toString("hex");
+    const samlRequest = Buffer.from(
+      `<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="_${crypto.randomBytes(16).toString("hex")}" Version="2.0" IssueInstant="${new Date().toISOString()}"/>`,
+    ).toString("base64");
+
+    return reply.send({
+      ssoUrl: "/api/v1/auth/saml/callback",
+      samlRequest,
+      relayState,
+    });
+  });
+
+  app.post("/api/v1/auth/saml/callback", async (request, reply) => {
+    const body = request.body as { samlResponse: string; relayState?: string; tenantId?: string };
+    if (!body.samlResponse) {
+      return reply.status(400).send({ error: "samlResponse is required." });
+    }
+
+    let claims: { email: string; name: string; sub: string };
+    try {
+      claims = parseMockSamlResponse(body.samlResponse);
+    } catch (err: unknown) {
+      return reply.status(401).send({ error: (err as Error).message });
+    }
+
+    const tenantId = body.tenantId ?? database.db.select().from(tenants).all()[0]?.id ?? "default";
+    const userList = database.db
+      .select()
+      .from(users)
+      .where(and(eq(users.email, claims.email.toLowerCase().trim()), eq(users.tenantId, tenantId)))
+      .all();
+
+    let user = userList[0];
+    const now = new Date().toISOString();
+
+    if (!user) {
+      const userId = generateEntityId("usr_");
+      database.db
+        .insert(users)
+        .values({
+          id: userId,
+          tenantId,
+          email: claims.email.toLowerCase().trim(),
+          displayName: claims.name,
+          systemRole: "SecretConsumer",
+          kdfAlgorithm: "PBKDF2-HMAC-SHA256",
+          kdfSalt: crypto.randomBytes(32).toString("hex"),
+          kdfIterations: 600000,
+          x25519PublicKey: "",
+          ed25519PublicKey: "",
+          publicKeyFingerprint: "",
+          encryptedX25519PrivateKey: "",
+          encryptedEd25519PrivateKey: "",
+          isBreakGlassAdmin: false,
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        })
+        .run();
+      user = database.db.select().from(users).where(eq(users.id, userId)).all()[0]!;
+    }
+
+    const caller: AuthenticatedCaller = {
+      actorId: user.id,
+      actorType: "user",
+      tenantId: user.tenantId,
+      email: user.email,
+      displayName: user.displayName,
+      systemRole: user.systemRole,
+      scopes: Object.values(VAULT_ROLE_PERMISSIONS.SecretConsumer),
+    };
+
+    const token = issueSessionToken(caller);
+    recordAudit(tenantId, null, user.id, "user", "secrets:read", user.id, request.ip, {
+      method: "saml2",
+      sub: claims.sub,
+    });
+
+    return reply.send({
+      userId: user.id,
+      tenantId: user.tenantId,
+      email: user.email,
+      displayName: user.displayName,
+      systemRole: user.systemRole,
+      kdfSalt: user.kdfSalt,
+      kdfIterations: user.kdfIterations,
+      publicKeyFingerprint: user.publicKeyFingerprint,
+      encryptedX25519PrivateKey: user.encryptedX25519PrivateKey,
+      sessionToken: token,
+      unlockRequired: true,
+    });
+  });
+
+  app.post("/api/v1/auth/break-glass/login", async (request, reply) => {
+    const body = request.body as {
+      email: string;
+      clientAuthKeyHex: string;
+      totpCode: string;
+      reason: string;
+      tenantId?: string;
+    };
+
+    if (!body.email || !body.clientAuthKeyHex || !body.totpCode || !body.reason) {
+      return reply.status(400).send({
+        error: "email, clientAuthKeyHex, totpCode, and reason are required for break-glass login.",
+      });
+    }
+
+    const userList = database.db
+      .select()
+      .from(users)
+      .where(eq(users.email, body.email.toLowerCase().trim()))
+      .all();
+
+    const user = userList[0];
+    if (!user || user.status !== "active" || !user.isBreakGlassAdmin || !user.serverPasswordHash) {
+      return reply.status(401).send({ error: "Invalid break-glass credentials or unauthorized." });
+    }
+
+    const calculatedHash = hashServerPassword(body.clientAuthKeyHex, user.kdfSalt);
+    if (calculatedHash !== user.serverPasswordHash) {
+      return reply.status(401).send({ error: "Invalid break-glass credentials." });
+    }
+
+    if (!user.totpSecret) {
+      return reply.status(403).send({ error: "MFA not configured for this break-glass admin." });
+    }
+
+    const isTotpValid = await verifyTotpCode(body.totpCode, user.totpSecret);
+    if (!isTotpValid) {
+      return reply.status(401).send({ error: "Invalid or expired TOTP MFA code." });
+    }
+
+    const caller: AuthenticatedCaller = {
+      actorId: user.id,
+      actorType: "user",
+      tenantId: user.tenantId,
+      email: user.email,
+      displayName: user.displayName,
+      systemRole: "SuperAdmin",
+      scopes: Object.values(VAULT_ROLE_PERMISSIONS.WorkspaceOwner),
+    };
+
+    const token = issueSessionToken(caller);
+    recordAudit(user.tenantId, null, user.id, "user", "admin:users:manage", user.id, request.ip, {
+      severity: "CRITICAL",
+      action: "break_glass_login",
+      reason: body.reason,
+    });
+
+    return reply.send({
+      userId: user.id,
+      tenantId: user.tenantId,
+      displayName: user.displayName,
+      systemRole: user.systemRole,
+      kdfSalt: user.kdfSalt,
+      kdfIterations: user.kdfIterations,
+      publicKeyFingerprint: user.publicKeyFingerprint,
+      encryptedX25519PrivateKey: user.encryptedX25519PrivateKey,
+      sessionToken: token,
+      isBreakGlass: true,
     });
   });
 
@@ -493,10 +899,382 @@ export function buildServer(options: BuildServerOptions = {}): FastifyInstance {
         name: vault.name,
         description: vault.description,
         keyVersion: vault.keyVersion,
+        rotationRequired: Boolean(vault.rotationRequired),
         createdAt: vault.createdAt,
         updatedAt: vault.updatedAt,
       },
       encryptedVaultKey: wrappedKeyEnvelope,
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Vault Sharing, Revocation & Key Rotation Routes
+  // -------------------------------------------------------------------------
+
+  app.post("/api/v1/vaults/:vaultId/members", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "vaults:share", reply);
+    const { vaultId } = request.params as { vaultId: string };
+
+    const body = request.body as {
+      userId: string;
+      vaultRole: VaultRole;
+      encryptedVaultKey: {
+        ciphertext: string;
+        iv: string;
+        authTag: string;
+        aad: string;
+        keyVersion: number;
+      };
+    };
+
+    if (!body.userId || !body.vaultRole || !body.encryptedVaultKey) {
+      return reply
+        .status(400)
+        .send({ error: "userId, vaultRole, and encryptedVaultKey are required." });
+    }
+
+    const vaultList = database.db.select().from(vaults).where(eq(vaults.id, vaultId)).all();
+    const vault = vaultList[0];
+    if (!vault) {
+      return reply.status(404).send({ error: `Vault ${vaultId} not found.` });
+    }
+
+    const recipientList = database.db.select().from(users).where(eq(users.id, body.userId)).all();
+    const recipient = recipientList[0];
+    if (!recipient || recipient.status !== "active") {
+      return reply.status(404).send({ error: `Recipient user ${body.userId} not found.` });
+    }
+
+    const now = new Date().toISOString();
+    const existing = database.db
+      .select()
+      .from(vaultMemberKeys)
+      .where(and(eq(vaultMemberKeys.vaultId, vaultId), eq(vaultMemberKeys.userId, body.userId)))
+      .all();
+
+    let memberKeyId: string;
+    if (existing.length > 0 && existing[0]?.id) {
+      memberKeyId = existing[0].id;
+      database.db
+        .update(vaultMemberKeys)
+        .set({
+          vaultRole: body.vaultRole,
+          keyVersion: body.encryptedVaultKey.keyVersion,
+          encryptedVaultKey: body.encryptedVaultKey.ciphertext,
+          iv: body.encryptedVaultKey.iv,
+          authTag: body.encryptedVaultKey.authTag,
+          aad: body.encryptedVaultKey.aad,
+          grantedByUserId: caller.actorId,
+          revokedAt: null,
+        })
+        .where(eq(vaultMemberKeys.id, memberKeyId))
+        .run();
+    } else {
+      memberKeyId = generateEntityId("vlt_");
+      database.db
+        .insert(vaultMemberKeys)
+        .values({
+          id: memberKeyId,
+          tenantId: caller.tenantId,
+          vaultId,
+          userId: body.userId,
+          vaultRole: body.vaultRole,
+          keyVersion: body.encryptedVaultKey.keyVersion,
+          encryptedVaultKey: body.encryptedVaultKey.ciphertext,
+          iv: body.encryptedVaultKey.iv,
+          authTag: body.encryptedVaultKey.authTag,
+          aad: body.encryptedVaultKey.aad,
+          grantedByUserId: caller.actorId,
+          createdAt: now,
+          revokedAt: null,
+        })
+        .run();
+    }
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "vaults:share",
+      body.userId,
+      request.ip,
+      { vaultRole: body.vaultRole, keyVersion: body.encryptedVaultKey.keyVersion },
+    );
+
+    return reply.status(201).send({
+      id: memberKeyId,
+      vaultId,
+      userId: body.userId,
+      vaultRole: body.vaultRole,
+      keyVersion: body.encryptedVaultKey.keyVersion,
+    });
+  });
+
+  app.get("/api/v1/vaults/:vaultId/members", async (request, reply) => {
+    requireAuth(request, reply);
+    const { vaultId } = request.params as { vaultId: string };
+
+    const members = database.db
+      .select({
+        id: vaultMemberKeys.id,
+        userId: vaultMemberKeys.userId,
+        vaultRole: vaultMemberKeys.vaultRole,
+        keyVersion: vaultMemberKeys.keyVersion,
+        grantedByUserId: vaultMemberKeys.grantedByUserId,
+        createdAt: vaultMemberKeys.createdAt,
+        revokedAt: vaultMemberKeys.revokedAt,
+        email: users.email,
+        displayName: users.displayName,
+        x25519PublicKey: users.x25519PublicKey,
+        publicKeyFingerprint: users.publicKeyFingerprint,
+      })
+      .from(vaultMemberKeys)
+      .innerJoin(users, eq(vaultMemberKeys.userId, users.id))
+      .where(eq(vaultMemberKeys.vaultId, vaultId))
+      .all();
+
+    return reply.send({ members });
+  });
+
+  app.delete("/api/v1/vaults/:vaultId/members/:userId", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "vaults:share", reply);
+    const { vaultId, userId } = request.params as { vaultId: string; userId: string };
+
+    const now = new Date().toISOString();
+    database.db
+      .update(vaultMemberKeys)
+      .set({ revokedAt: now })
+      .where(and(eq(vaultMemberKeys.vaultId, vaultId), eq(vaultMemberKeys.userId, userId)))
+      .run();
+
+    // Mandatory VaultKey rotation flag per [H-2]
+    database.db
+      .update(vaults)
+      .set({ rotationRequired: true, updatedAt: now })
+      .where(eq(vaults.id, vaultId))
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "vaults:share",
+      userId,
+      request.ip,
+      { action: "revoke_member", rotationRequired: true },
+    );
+
+    return reply.send({
+      status: "revoked",
+      vaultId,
+      userId,
+      rotationRequired: true,
+      message: "Member revoked. Mandatory VaultKey rotation is required on this vault.",
+    });
+  });
+
+  app.delete("/api/v1/vaults/:vaultId/agents/:agentId", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "agent:token:revoke", reply);
+    const { vaultId, agentId } = request.params as { vaultId: string; agentId: string };
+
+    const now = new Date().toISOString();
+    database.db
+      .update(agents)
+      .set({ status: "revoked", revokedAt: now })
+      .where(and(eq(agents.vaultId, vaultId), eq(agents.id, agentId)))
+      .run();
+
+    // Mandatory VaultKey rotation flag per [H-2]
+    database.db
+      .update(vaults)
+      .set({ rotationRequired: true, updatedAt: now })
+      .where(eq(vaults.id, vaultId))
+      .run();
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "agent:token:revoke",
+      agentId,
+      request.ip,
+      { action: "revoke_agent", rotationRequired: true },
+    );
+
+    return reply.send({
+      status: "revoked",
+      vaultId,
+      agentId,
+      rotationRequired: true,
+      message: "Agent token revoked. Mandatory VaultKey rotation is required on this vault.",
+    });
+  });
+
+  app.post("/api/v1/vaults/:vaultId/rotate-key", async (request, reply) => {
+    const caller = requireAuth(request, reply);
+    requireScope(caller, "vaults:rotate_key", reply);
+    const { vaultId } = request.params as { vaultId: string };
+
+    const body = request.body as {
+      newKeyVersion: number;
+      memberKeys: Array<{
+        userId: string;
+        encryptedVaultKey: string;
+        iv: string;
+        authTag: string;
+        aad: string;
+      }>;
+      agentKeys?: Array<{
+        agentId: string;
+        agentEncryptedVaultKey: string;
+        iv: string;
+        authTag: string;
+        aad: string;
+      }>;
+      reencryptedSecrets?: Array<{
+        secretId: string;
+        encryptedPayload: string;
+        payloadIv: string;
+        payloadAuthTag: string;
+        payloadAad: string;
+      }>;
+    };
+
+    if (!body.newKeyVersion || !body.memberKeys || body.memberKeys.length === 0) {
+      return reply
+        .status(400)
+        .send({ error: "newKeyVersion and memberKeys for remaining members are required." });
+    }
+
+    const vaultList = database.db.select().from(vaults).where(eq(vaults.id, vaultId)).all();
+    const vault = vaultList[0];
+    if (!vault) {
+      return reply.status(404).send({ error: `Vault ${vaultId} not found.` });
+    }
+
+    if (body.newKeyVersion !== vault.keyVersion + 1) {
+      return reply.status(400).send({
+        error: `Invalid newKeyVersion: expected ${vault.keyVersion + 1}, received ${body.newKeyVersion}`,
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    // Update vault key version and clear rotationRequired
+    database.db
+      .update(vaults)
+      .set({
+        keyVersion: body.newKeyVersion,
+        rotationRequired: false,
+        updatedAt: now,
+      })
+      .where(eq(vaults.id, vaultId))
+      .run();
+
+    // Update active members with new wrapped key
+    for (const mem of body.memberKeys) {
+      database.db
+        .update(vaultMemberKeys)
+        .set({
+          keyVersion: body.newKeyVersion,
+          encryptedVaultKey: mem.encryptedVaultKey,
+          iv: mem.iv,
+          authTag: mem.authTag,
+          aad: mem.aad,
+          revokedAt: null,
+        })
+        .where(and(eq(vaultMemberKeys.vaultId, vaultId), eq(vaultMemberKeys.userId, mem.userId)))
+        .run();
+    }
+
+    // Update active agents if provided
+    if (body.agentKeys) {
+      for (const ag of body.agentKeys) {
+        database.db
+          .update(agents)
+          .set({
+            keyVersion: body.newKeyVersion,
+            agentEncryptedVaultKey: ag.agentEncryptedVaultKey,
+            iv: ag.iv,
+            authTag: ag.authTag,
+            aad: ag.aad,
+          })
+          .where(and(eq(agents.vaultId, vaultId), eq(agents.id, ag.agentId)))
+          .run();
+      }
+    }
+
+    // Re-encrypt active secret payloads
+    if (body.reencryptedSecrets) {
+      for (const sec of body.reencryptedSecrets) {
+        const secretRecords = database.db
+          .select()
+          .from(secrets)
+          .where(eq(secrets.id, sec.secretId))
+          .all();
+        const currentSecret = secretRecords[0];
+        if (currentSecret) {
+          const nextVersion = currentSecret.currentVersion + 1;
+          database.db
+            .insert(secretVersions)
+            .values({
+              id: generateEntityId("sec_"),
+              tenantId: caller.tenantId,
+              vaultId,
+              secretId: sec.secretId,
+              version: nextVersion,
+              keyVersion: body.newKeyVersion,
+              encryptedPayload: sec.encryptedPayload,
+              payloadIv: sec.payloadIv,
+              payloadAuthTag: sec.payloadAuthTag,
+              payloadAad: sec.payloadAad,
+              createdByActorId: caller.actorId,
+              createdAt: now,
+            })
+            .run();
+
+          database.db
+            .update(secrets)
+            .set({
+              currentVersion: nextVersion,
+              keyVersion: body.newKeyVersion,
+              updatedAt: now,
+            })
+            .where(eq(secrets.id, sec.secretId))
+            .run();
+        }
+      }
+    }
+
+    recordAudit(
+      caller.tenantId,
+      vaultId,
+      caller.actorId,
+      caller.actorType,
+      "vaults:rotate_key",
+      vaultId,
+      request.ip,
+      {
+        previousKeyVersion: vault.keyVersion,
+        newKeyVersion: body.newKeyVersion,
+        membersRotated: body.memberKeys.length,
+        agentsRotated: body.agentKeys?.length ?? 0,
+        secretsReencrypted: body.reencryptedSecrets?.length ?? 0,
+      },
+    );
+
+    return reply.send({
+      status: "rotated",
+      vaultId,
+      keyVersion: body.newKeyVersion,
+      rotationRequired: false,
+      membersCount: body.memberKeys.length,
     });
   });
 

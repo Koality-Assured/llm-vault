@@ -6,8 +6,10 @@ import {
   GENESIS_AUDIT_EVENT_HASH,
   MIN_PBKDF2_ITERATIONS,
   base64ToBytes,
+  base32ToBytes,
   buildCanonicalAad,
   bytesToBase64,
+  bytesToBase32,
   computeAuditEventHash,
   computeTagBlindIndex,
   createArgon2idKdfProvider,
@@ -16,6 +18,7 @@ import {
   decryptWithAad,
   deriveMasterKeyMaterial,
   deriveMasterSubkeys,
+  deriveMasterSubkeysFromPrf,
   deriveVaultSearchKey,
   encryptSecretMetadata,
   encryptSecretPayload,
@@ -23,6 +26,8 @@ import {
   formatCanonicalAadString,
   generateAgentDecryptionKey,
   generateSalt,
+  generateTotpCode,
+  generateTotpSecret,
   generateUserKeyPairs,
   generateVaultKey,
   generateVaultKeyBytes,
@@ -32,6 +37,7 @@ import {
   unwrapVaultKeyFromSender,
   verifyAuditHashChain,
   verifyPayloadSignature,
+  verifyTotpCode,
   wrapUserPrivateKey,
   wrapVaultKeyForAgent,
   wrapVaultKeyForRecipient,
@@ -341,5 +347,65 @@ describe("@llm-vault/crypto", () => {
     const ab = new Uint8Array([9, 8, 7, 6]).buffer;
     zeroizeBuffer(ab);
     expect(Array.from(new Uint8Array(ab))).toEqual([0, 0, 0, 0]);
+  });
+
+  it("derives master subkeys directly from WebAuthn PRF output bytes", async () => {
+    const salt = generateSalt();
+    const prfOutput = new Uint8Array(32);
+    globalThis.crypto.getRandomValues(prfOutput);
+
+    const subkeys1 = await deriveMasterSubkeysFromPrf(prfOutput, salt);
+    const subkeys2 = await deriveMasterSubkeysFromPrf(prfOutput, salt);
+
+    expect(subkeys1.masterEncryptionKey.extractable).toBe(false);
+    expect(subkeys1.clientAuthKey.byteLength).toBe(32);
+    expect(subkeys1.clientAuthKeyHex).toHaveLength(64);
+    expect(subkeys1.clientAuthKeyHex).toBe(subkeys2.clientAuthKeyHex);
+
+    // Reject undersized PRF output
+    await expect(deriveMasterSubkeysFromPrf(new Uint8Array(16), salt)).rejects.toThrow(RangeError);
+  });
+
+  it("encodes and decodes standard Base32 strings", () => {
+    const raw = new Uint8Array([72, 101, 108, 108, 111, 33]); // "Hello!"
+    const b32 = bytesToBase32(raw);
+    expect(b32).toBe("JBSWY3DPEE");
+    const roundtrip = base32ToBytes(b32);
+    expect(roundtrip).toEqual(raw);
+
+    // Handles lowercase and spaces/padding
+    expect(base32ToBytes("jbswy3dpee==")).toEqual(raw);
+  });
+
+  it("generates and verifies RFC 6238 TOTP codes", async () => {
+    const { secretBytes, secretBase32 } = generateTotpSecret(20);
+    expect(secretBytes.byteLength).toBe(20);
+    expect(secretBase32.length).toBeGreaterThan(20);
+
+    const now = Date.now();
+    const code = await generateTotpCode(secretBase32, now);
+    expect(code).toMatch(/^\d{6}$/);
+
+    // Valid within current window
+    const valid = await verifyTotpCode(code, secretBase32, { timestampMs: now });
+    expect(valid).toBe(true);
+
+    // Works with raw bytes as well
+    const validBytes = await verifyTotpCode(code, secretBytes, { timestampMs: now });
+    expect(validBytes).toBe(true);
+
+    // Rejects incorrect code
+    const invalid = await verifyTotpCode("000000" === code ? "999999" : "000000", secretBase32, {
+      timestampMs: now,
+    });
+    expect(invalid).toBe(false);
+
+    // Rejects code outside window (+5 minutes later with window 1)
+    const futureTime = now + 300_000;
+    const expired = await verifyTotpCode(code, secretBase32, {
+      timestampMs: futureTime,
+      window: 1,
+    });
+    expect(expired).toBe(false);
   });
 });
