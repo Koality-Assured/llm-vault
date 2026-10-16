@@ -49,6 +49,8 @@ export type AuditId = EntityId<"aud">;
 export type WorkloadBindingId = EntityId<"wkb">;
 
 export type SecretHandle = `{{vault:sec_${string}}}`;
+export type LeaseHandle = `{{vault:lease_${string}}}`;
+export type VaultHandle = SecretHandle | LeaseHandle;
 
 export interface ParsedEntityId {
   id: string;
@@ -63,6 +65,7 @@ const PREFIX_NAME_SET = new Set<string>(ENTITY_PREFIX_NAMES);
 const ULID_REGEX = /^[0-7][0-9a-hjkmnp-tv-z]{25}$/i;
 const ENTITY_ID_REGEX = /^(sec|vlt|fld|usr|agt|lease|aud|wkb)_([0-7][0-9a-hjkmnp-tv-z]{25})$/i;
 const SECRET_HANDLE_REGEX = /^\{\{vault:(sec_[0-7][0-9a-hjkmnp-tv-z]{25})\}\}$/i;
+export const VAULT_HANDLE_REGEX = /^\{\{vault:((?:sec|lease)_[0-7][0-9a-hjkmnp-tv-z]{25})\}\}$/i;
 
 export function normalizePrefix(prefix: EntityPrefixInput): {
   prefix: EntityPrefix;
@@ -271,4 +274,48 @@ export function isValidSecretHandle(handle: unknown): handle is SecretHandle {
     return false;
   }
   return SECRET_HANDLE_REGEX.test(handle.trim());
+}
+
+export function formatLeaseHandle(leaseId: string): LeaseHandle {
+  const parsed = parseEntityId(leaseId);
+  if (parsed.prefixName !== "lease") {
+    throw new Error(`Expected lease identifier with prefix "lease_", received "${parsed.prefix}"`);
+  }
+  return `{{vault:${parsed.id}}}` as LeaseHandle;
+}
+
+export function formatVaultHandle(id: string): VaultHandle {
+  const parsed = parseEntityId(id);
+  if (parsed.prefixName !== "sec" && parsed.prefixName !== "lease") {
+    throw new Error(`Expected "sec_" or "lease_" identifier, received "${parsed.prefix}"`);
+  }
+  return `{{vault:${parsed.id}}}` as VaultHandle;
+}
+
+export function parseVaultHandle(handle: string): {
+  handle: VaultHandle;
+  id: string;
+  prefixName: "sec" | "lease";
+  ulid: string;
+  timestampMs: number;
+} {
+  const match = VAULT_HANDLE_REGEX.exec(handle.trim());
+  if (!match) {
+    throw new Error(`Invalid opaque vault handle: "${handle}"`);
+  }
+  const parsed = parseEntityId(match[1]!);
+  return {
+    handle: `{{vault:${parsed.id}}}` as VaultHandle,
+    id: parsed.id,
+    prefixName: parsed.prefixName as "sec" | "lease",
+    ulid: parsed.ulid,
+    timestampMs: parsed.timestampMs,
+  };
+}
+
+export function isValidVaultHandle(handle: unknown): handle is VaultHandle {
+  if (typeof handle !== "string") {
+    return false;
+  }
+  return VAULT_HANDLE_REGEX.test(handle.trim());
 }

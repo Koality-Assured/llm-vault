@@ -24,8 +24,10 @@ export class SecretResolver {
    * Resolves a secret reference by ID and optional field name.
    */
   async resolveSecret(secretId: string, field?: string): Promise<string> {
-    if (!isValidEntityId(secretId, "sec_")) {
-      throw new Error(`Invalid secret ID format: "${secretId}". Expected "sec_<ulid>".`);
+    if (!isValidEntityId(secretId, "sec_") && !isValidEntityId(secretId, "lease_")) {
+      throw new Error(
+        `Invalid secret or lease ID format: "${secretId}". Expected "sec_<ulid>" or "lease_<ulid>".`,
+      );
     }
 
     let payload = this.cache.get(secretId);
@@ -74,10 +76,10 @@ export class SecretResolver {
   }
 
   /**
-   * Resolves all `{{vault:sec_<ulid>[#field]}}` placeholders in a text string.
+   * Resolves all `{{vault:sec_<ulid>[#field]}}` or `{{vault:lease_<ulid>[#field]}}` placeholders in a text string.
    */
   async resolveString(template: string): Promise<string> {
-    const pattern = /\{\{vault:(sec_[0-9A-HJ-NP-Za-km-z]{26})(?:#([a-zA-Z0-9_-]+))?\}\}/g;
+    const pattern = /\{\{vault:((?:sec|lease)_[0-9A-HJ-NP-Za-km-z]{26})(?:#([a-zA-Z0-9_-]+))?\}\}/gi;
     const matches = Array.from(template.matchAll(pattern));
 
     if (matches.length === 0) {
@@ -98,7 +100,7 @@ export class SecretResolver {
   }
 
   /**
-   * Resolves environment variable map, expanding any `vault:sec_...` or `{{vault:...}}` values.
+   * Resolves environment variable map, expanding any `vault:sec_...`, `vault:lease_...`, or `{{vault:...}}` values.
    */
   async resolveEnv(
     inputEnv: Record<string, string | undefined>,
@@ -108,8 +110,8 @@ export class SecretResolver {
     for (const [key, value] of Object.entries(inputEnv)) {
       if (value === undefined) continue;
 
-      // Handle bare handle: "vault:sec_01jk..."
-      if (value.startsWith("vault:sec_")) {
+      // Handle bare handle: "vault:sec_01jk..." or "vault:lease_01jk..."
+      if (value.startsWith("vault:sec_") || value.startsWith("vault:lease_")) {
         const parts = value.slice("vault:".length).split("#");
         const secId = parts[0]!;
         const field = parts[1];
@@ -135,8 +137,13 @@ export class SecretResolver {
     const lines = content.split(/\r?\n/);
 
     for (const line of lines) {
-      const trimmed = line.trim();
+      let trimmed = line.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
+
+      // Strip leading 'export ' keyword if present (e.g. export KEY=VALUE)
+      if (trimmed.startsWith("export ")) {
+        trimmed = trimmed.slice(7).trim();
+      }
 
       const eqIdx = trimmed.indexOf("=");
       if (eqIdx === -1) continue;
@@ -146,10 +153,18 @@ export class SecretResolver {
 
       // Strip surrounding quotes
       if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
+        (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+        (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
       ) {
         value = value.slice(1, -1);
+      } else {
+        // Strip trailing unquoted comments (# ...)
+        const commentIdx = value.indexOf(" #");
+        if (commentIdx !== -1) {
+          value = value.slice(0, commentIdx).trim();
+        } else if (value.startsWith("#")) {
+          value = "";
+        }
       }
 
       env[key] = value;
