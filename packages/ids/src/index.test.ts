@@ -8,11 +8,15 @@ import {
   encodeUlidTime,
   extractUlidTimestamp,
   formatSecretHandle,
+  formatLeaseHandle,
+  formatVaultHandle,
   generateEntityId,
   isValidEntityId,
   isValidSecretHandle,
+  isValidVaultHandle,
   parseEntityId,
   parseSecretHandle,
+  parseVaultHandle,
 } from "./index.js";
 
 describe("@llm-vault/ids", () => {
@@ -96,5 +100,31 @@ describe("@llm-vault/ids", () => {
     expect(() => formatSecretHandle(vaultId)).toThrow();
     expect(() => parseSecretHandle("{{vault:vlt_01jk7a89b2c3d4e5f6g7h8j9k1}}")).toThrow();
     expect(isValidSecretHandle("plaintext-secret")).toBe(false);
+  });
+
+  it("formats and parses ephemeral lease handles and unified vault handles", () => {
+    const leaseId = generateEntityId("lease_", 1_728_900_777_000);
+    const leaseHandle = formatLeaseHandle(leaseId);
+    expect(leaseHandle).toBe(`{{vault:${leaseId}}}`);
+    expect(formatVaultHandle(leaseId)).toBe(leaseHandle);
+    expect(isValidVaultHandle(leaseHandle)).toBe(true);
+
+    const parsedLease = parseVaultHandle(leaseHandle);
+    expect(parsedLease.handle).toBe(leaseHandle);
+    expect(parsedLease.id).toBe(leaseId);
+    expect(parsedLease.prefixName).toBe("lease");
+    expect(parsedLease.timestampMs).toBe(1_728_900_777_000);
+
+    const secId = generateEntityId("sec_", 1_728_900_888_000);
+    const secHandle = formatVaultHandle(secId);
+    expect(secHandle).toBe(`{{vault:${secId}}}`);
+    expect(isValidVaultHandle(secHandle)).toBe(true);
+
+    const parsedSec = parseVaultHandle(secHandle);
+    expect(parsedSec.id).toBe(secId);
+    expect(parsedSec.prefixName).toBe("sec");
+
+    expect(() => formatLeaseHandle(secId)).toThrow();
+    expect(() => parseVaultHandle("{{vault:usr_01jk7a89b2c3d4e5f6g7h8j9k1}}")).toThrow();
   });
 });

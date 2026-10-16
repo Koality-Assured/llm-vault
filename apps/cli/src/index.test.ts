@@ -185,20 +185,47 @@ describe("@llm-vault/cli", () => {
       expect(resolver.getActiveSecrets().length).toBe(0);
     });
 
-    it("parses .env / .env.vault template syntax", () => {
+    it("parses .env / .env.vault template syntax with export keywords, comments, and quotes", () => {
       const dotenvContent = `
 # Database configuration
 DATABASE_URL={{vault:sec_01jk0000000000000000000001}}
-PORT=8080
+export PORT=8080
 API_KEY="{{vault:sec_01jk0000000000000000000002}}"
 # Trailing comments
 DEBUG='true'
+UNQUOTED_COMMENT={{vault:sec_01jk0000000000000000000003}} # inline comment
+EXPORTED_SECRET=export my_val
 `;
       const parsed = SecretResolver.parseDotenv(dotenvContent);
       expect(parsed.DATABASE_URL).toBe("{{vault:sec_01jk0000000000000000000001}}");
       expect(parsed.PORT).toBe("8080");
       expect(parsed.API_KEY).toBe("{{vault:sec_01jk0000000000000000000002}}");
       expect(parsed.DEBUG).toBe("true");
+      expect(parsed.UNQUOTED_COMMENT).toBe("{{vault:sec_01jk0000000000000000000003}}");
+      expect(parsed.EXPORTED_SECRET).toBe("export my_val");
+    });
+
+    it("resolves ephemeral lease handles ({{vault:lease_...}}) seamlessly alongside sec_ handles", async () => {
+      const leaseId = generateEntityId("lease_");
+      const secId = generateEntityId("sec_");
+
+      const mockStore: Record<string, string> = {
+        [leaseId]: "ephemeral-lease-token-999",
+        [secId]: "permanent-secret-token-111",
+      };
+
+      const resolver = new SecretResolver(async (id) => mockStore[id] ?? null);
+
+      const template = `Bearer {{vault:${leaseId}}} and Key={{vault:${secId}}}`;
+      const resolved = await resolver.resolveString(template);
+      expect(resolved).toBe("Bearer ephemeral-lease-token-999 and Key=permanent-secret-token-111");
+
+      const envResult = await resolver.resolveEnv({
+        LEASE_VAR: `vault:${leaseId}`,
+        SEC_VAR: `{{vault:${secId}}}`,
+      });
+      expect(envResult.resolvedEnv.LEASE_VAR).toBe("ephemeral-lease-token-999");
+      expect(envResult.resolvedEnv.SEC_VAR).toBe("permanent-secret-token-111");
     });
   });
 
@@ -895,6 +922,68 @@ DEBUG='true'
 
         daemon.stop();
       });
+
+      it("strictly blocks directory traversal and empty filenames in sidecar", async () => {
+        const mountPath = path.join(tempDir, "traversal-secrets");
+
+        // Traversal attempt should throw
+        await expect(
+          syncSecretsToVolume({
+            mountPath,
+            secrets: [
+              {
+                secretId: generateEntityId("sec_"),
+                outputFilename: "../../etc/passwd",
+                content: "root:x:0:0::/root:/bin/bash\n",
+              },
+            ],
+          }),
+        ).rejects.toThrow(/directory traversal blocked/i);
+
+        // Empty filename should throw
+        await expect(
+          syncSecretsToVolume({
+            mountPath,
+            secrets: [
+              {
+                secretId: generateEntityId("sec_"),
+                outputFilename: "   ",
+                content: "empty\n",
+              },
+            ],
+          }),
+        ).rejects.toThrow(/filename cannot be empty/i);
+      });
+
+      it("recursively prunes stale files in nested subdirectories", async () => {
+        const mountPath = path.join(tempDir, "recursive-prune");
+
+        // Step 1: sync nested file
+        await syncSecretsToVolume({
+          mountPath,
+          secrets: [
+            {
+              secretId: generateEntityId("sec_"),
+              outputFilename: "nested/sub/creds.env",
+              content: "SECRET=val1\n",
+            },
+          ],
+        });
+
+        const nestedFile = path.join(mountPath, "nested", "sub", "creds.env");
+        expect(fs.existsSync(nestedFile)).toBe(true);
+
+        // Step 2: sync empty secrets with cleanStaleFiles = true
+        const pruneResult = await syncSecretsToVolume({
+          mountPath,
+          secrets: [],
+          cleanStaleFiles: true,
+        });
+
+        expect(pruneResult.cleanedFiles).toContain(nestedFile);
+        expect(fs.existsSync(nestedFile)).toBe(false);
+        expect(fs.existsSync(path.join(mountPath, "nested", "sub"))).toBe(false);
+      });
     });
 
     describe("CLI Commands: sidecar", () => {
@@ -913,6 +1002,39 @@ DEBUG='true'
         const secretFile = path.join(mountPath, "secret.env");
         expect(fs.existsSync(secretFile)).toBe(true);
         expect(fs.readFileSync(secretFile, "utf8")).toBe("API_KEY=test-api-token-value");
+      });
+
+      it("executes llm-vault sidecar sync with --prune", async () => {
+        const mountPath = path.join(tempDir, "cli-sidecar-prune");
+        await fs.promises.mkdir(mountPath, { recursive: true });
+        const oldFile = path.join(mountPath, "old-secret.env");
+        await fs.promises.writeFile(oldFile, "OLD=1");
+
+        const code = await main([
+          "sidecar",
+          "sync",
+          "--mount-path",
+          mountPath,
+          "--file",
+          "new.env:NEW=2",
+          "--prune",
+        ]);
+
+        expect(code).toBe(0);
+        expect(fs.existsSync(path.join(mountPath, "new.env"))).toBe(true);
+        expect(fs.existsSync(oldFile)).toBe(false);
+      });
+    });
+
+    describe("CLI Commands: graceful error handling", () => {
+      it("fails gracefully with exit code 1 when run or inject arguments are invalid", async () => {
+        // Missing child command
+        expect(await main(["run"])).toBe(1);
+        expect(await main(["inject"])).toBe(1);
+
+        // Missing session
+        expect(await main(["run", "--", "node", "-v"])).toBe(1);
+        expect(await main(["inject", "--template", "app.tpl", "--", "node", "-v"])).toBe(1);
       });
     });
   });

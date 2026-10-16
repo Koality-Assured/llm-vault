@@ -64,7 +64,7 @@ SSH AGENT OPTIONS:
   llm-vault ssh-agent [start|status] [--socket <path>] [--approval-mode <auto|interactive|oob>]
 
 SIDECAR OPTIONS:
-  llm-vault sidecar sync [--mount-path <path>] [--file <name:content>]
+  llm-vault sidecar sync [--mount-path <path>] [--file <name:content>] [--clean-stale|--prune]
 
 LOGIN OPTIONS:
   --endpoint <url>    Vault API server URL (e.g. http://localhost:3000)
@@ -122,12 +122,15 @@ async function createRemoteFetcher(session: { endpoint: string; token: string; t
 }
 
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
-  if (argv.length === 0 || argv.includes("-h") || argv.includes("--help") || argv[0] === "help") {
+  const dashDashIdx = argv.indexOf("--");
+  const cliArgs = dashDashIdx !== -1 ? argv.slice(0, dashDashIdx) : argv;
+
+  if (cliArgs.length === 0 || cliArgs.includes("-h") || cliArgs.includes("--help") || cliArgs[0] === "help") {
     console.log(HELP_TEXT.trim());
     return 0;
   }
 
-  if (argv.includes("-v") || argv.includes("--version")) {
+  if (cliArgs.includes("-v") || cliArgs.includes("--version") || cliArgs[0] === "version") {
     console.log("llm-vault CLI v0.1.0");
     return 0;
   }
@@ -136,9 +139,9 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const commandArgs = argv.slice(1);
 
   // Separate args before "--" (CLI options) and after "--" (child command)
-  const dashDashIdx = commandArgs.indexOf("--");
-  const cliOptionsArgs = dashDashIdx !== -1 ? commandArgs.slice(0, dashDashIdx) : commandArgs;
-  const childCommandParts = dashDashIdx !== -1 ? commandArgs.slice(dashDashIdx + 1) : [];
+  const cmdDashDashIdx = commandArgs.indexOf("--");
+  const cliOptionsArgs = cmdDashDashIdx !== -1 ? commandArgs.slice(0, cmdDashDashIdx) : commandArgs;
+  const childCommandParts = cmdDashDashIdx !== -1 ? commandArgs.slice(cmdDashDashIdx + 1) : [];
 
   switch (command) {
     case "status":
@@ -237,25 +240,30 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return 1;
       }
 
-      const fetcher = await createRemoteFetcher(session);
-      const resolver = new SecretResolver(fetcher);
-
       const [childCmd, ...childArgs] = childCommandParts;
       if (!childCmd) {
         console.error("Error: Child command is empty.");
         return 1;
       }
 
-      const result = await runCommand({
-        command: childCmd,
-        args: childArgs,
-        envFile: values["env-file"],
-        resolver,
-        streamOutput: values.stream ?? true,
-        captureOutput: false,
-      });
+      try {
+        const fetcher = await createRemoteFetcher(session);
+        const resolver = new SecretResolver(fetcher);
 
-      return result.exitCode;
+        const result = await runCommand({
+          command: childCmd,
+          args: childArgs,
+          envFile: values["env-file"],
+          resolver,
+          streamOutput: values.stream ?? true,
+          captureOutput: false,
+        });
+
+        return result.exitCode;
+      } catch (err) {
+        console.error("Run error:", err instanceof Error ? err.message : String(err));
+        return 1;
+      }
     }
 
     case "inject": {
@@ -287,26 +295,31 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         return 1;
       }
 
-      const fetcher = await createRemoteFetcher(session);
-      const resolver = new SecretResolver(fetcher);
-
       const [childCmd, ...childArgs] = childCommandParts;
       if (!childCmd) {
         console.error("Error: Child command is empty.");
         return 1;
       }
 
-      const result = await injectTemplate({
-        templatePath: values.template,
-        command: childCmd,
-        args: childArgs,
-        envVarName: values["fifo-env"] ?? "VAULT_CONFIG_FIFO",
-        resolver,
-        streamOutput: values.stream ?? true,
-        captureOutput: false,
-      });
+      try {
+        const fetcher = await createRemoteFetcher(session);
+        const resolver = new SecretResolver(fetcher);
 
-      return result.exitCode;
+        const result = await injectTemplate({
+          templatePath: values.template,
+          command: childCmd,
+          args: childArgs,
+          envVarName: values["fifo-env"] ?? "VAULT_CONFIG_FIFO",
+          resolver,
+          streamOutput: values.stream ?? true,
+          captureOutput: false,
+        });
+
+        return result.exitCode;
+      } catch (err) {
+        console.error("Inject error:", err instanceof Error ? err.message : String(err));
+        return 1;
+      }
     }
 
     case "scan": {
@@ -521,6 +534,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
         options: {
           "mount-path": { type: "string" },
           file: { type: "string" },
+          "clean-stale": { type: "boolean", default: false },
+          prune: { type: "boolean", default: false },
         },
         allowPositionals: true,
       });
@@ -546,7 +561,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
           const res = await syncSecretsToVolume({
             mountPath,
             secrets: secretsList,
-            cleanStaleFiles: false,
+            cleanStaleFiles: Boolean(values["clean-stale"] || values.prune),
           });
           console.log(
             `Sidecar successfully synchronized ${res.syncedCount} secret file(s) into ${mountPath}`,
@@ -559,7 +574,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       }
 
       console.error(
-        `Unknown sidecar action: "${subAction}". Usage: llm-vault sidecar sync [--mount-path <path>] [--file <name:content>]`,
+        `Unknown sidecar action: "${subAction}". Usage: llm-vault sidecar sync [--mount-path <path>] [--file <name:content>] [--clean-stale|--prune]`,
       );
       return 1;
     }
