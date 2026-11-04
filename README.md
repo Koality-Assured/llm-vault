@@ -15,7 +15,7 @@
 [![Node.js 22+](https://img.shields.io/badge/node-22+-green.svg)](https://nodejs.org/)
 [![TypeScript 5.x](https://img.shields.io/badge/typescript-5.x-blue.svg)](https://www.typescriptlang.org/)
 [![Security: Zero--Knowledge](https://img.shields.io/badge/security-Zero--Knowledge-purple.svg)](#cryptographic-design)
-[![Domain: Llm-Vault](https://img.shields.io/badge/domain-llm-vault-blueviolet.svg)](<>)
+[![Domain: Llm-Vault](https://img.shields.io/badge/domain-llm--vault-blueviolet.svg)](#)
 [![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow.svg)](https://conventionalcommits.org)
 
 </div>
