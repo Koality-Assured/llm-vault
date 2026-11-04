@@ -1775,23 +1775,17 @@ export function matchClaimPattern(
     return true;
   }
 
-  // Single wildcard pattern (e.g. "refs/heads/*", "repo:my-org/*")
+  // Wildcard pattern (supports single or multi-wildcards e.g. "refs/heads/*", "spiffe://example.com/ns/*/sa/*")
   if (expectedPattern.includes("*")) {
-    const starIdx = expectedPattern.indexOf("*");
-    const prefix = expectedPattern.slice(0, starIdx);
-    const suffix = expectedPattern.slice(starIdx + 1);
-
-    if (suffix === "") {
-      return actualStr.startsWith(prefix);
-    }
-    if (prefix === "") {
-      return actualStr.endsWith(suffix);
-    }
-    return (
-      actualStr.startsWith(prefix) &&
-      actualStr.endsWith(suffix) &&
-      actualStr.length >= prefix.length + suffix.length
-    );
+    const regexStr =
+      "^" +
+      expectedPattern
+        .split("*")
+        .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+        .join(".*") +
+      "$";
+    const regex = new RegExp(regexStr);
+    return regex.test(actualStr);
   }
 
   return actualStr === expectedPattern;

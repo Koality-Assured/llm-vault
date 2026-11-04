@@ -36,10 +36,24 @@ export interface SidecarDaemonInstance {
   forceSync(): Promise<SidecarSyncResult>;
 }
 
-export function sanitizeFilename(filename: string): string {
-  const normalized = path.normalize(filename).replace(/^(\.\.[/\\])+/, "");
-  if (normalized.includes("..") || path.isAbsolute(normalized)) {
+export function sanitizeFilename(filename: string, mountDir?: string): string {
+  if (!filename || !filename.trim()) {
+    throw new Error("Invalid output filename: filename cannot be empty");
+  }
+  const trimmed = filename.trim();
+  if (trimmed.includes("..") || path.isAbsolute(trimmed)) {
     throw new Error(`Invalid output filename (directory traversal blocked): ${filename}`);
+  }
+  const normalized = path.normalize(trimmed);
+  if (normalized.startsWith("..") || path.isAbsolute(normalized) || normalized === ".") {
+    throw new Error(`Invalid output filename (directory traversal blocked): ${filename}`);
+  }
+  if (mountDir) {
+    const resolvedMount = path.resolve(mountDir);
+    const resolvedTarget = path.resolve(resolvedMount, normalized);
+    if (!resolvedTarget.startsWith(resolvedMount + path.sep)) {
+      throw new Error(`Invalid output filename (directory traversal blocked): ${filename}`);
+    }
   }
   return normalized;
 }
@@ -62,7 +76,7 @@ export async function syncSecretsToVolume(options: SidecarSyncOptions): Promise<
   const validFilePaths = new Set<string>();
 
   for (const item of options.secrets) {
-    const safeName = sanitizeFilename(item.outputFilename);
+    const safeName = sanitizeFilename(item.outputFilename, mountDir);
     const destPath = path.join(mountDir, safeName);
     const targetDir = path.dirname(destPath);
 
@@ -94,13 +108,45 @@ export async function syncSecretsToVolume(options: SidecarSyncOptions): Promise<
 
   const cleanedFiles: string[] = [];
   if (options.cleanStaleFiles) {
-    const dirEntries = fs.readdirSync(mountDir);
-    for (const entry of dirEntries) {
-      const fullPath = path.join(mountDir, entry);
-      if (fs.statSync(fullPath).isFile() && !validFilePaths.has(fullPath)) {
+    const collectFiles = (dir: string): string[] => {
+      let results: string[] = [];
+      if (!fs.existsSync(dir)) return results;
+      const entries = fs.readdirSync(dir);
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry);
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          results = results.concat(collectFiles(fullPath));
+        } else {
+          results.push(fullPath);
+        }
+      }
+      return results;
+    };
+
+    const allExistingFiles = collectFiles(mountDir);
+    for (const fullPath of allExistingFiles) {
+      if (!validFilePaths.has(fullPath)) {
         fs.unlinkSync(fullPath);
         cleanedFiles.push(fullPath);
       }
+    }
+
+    const pruneEmptyDirs = (dir: string) => {
+      if (!fs.existsSync(dir) || dir === mountDir) return;
+      const files = fs.readdirSync(dir);
+      if (files.length === 0) {
+        try {
+          fs.rmdirSync(dir);
+        } catch {
+          // ignore
+        }
+        pruneEmptyDirs(path.dirname(dir));
+      }
+    };
+
+    for (const cleanedPath of cleanedFiles) {
+      pruneEmptyDirs(path.dirname(cleanedPath));
     }
   }
 

@@ -675,6 +675,32 @@ describe("@llm-vault/crypto", () => {
         ref: "refs/tags/*", // fails
       };
       expect(evaluateClaimFilters(claims, mismatchingFilters)).toBe(false);
+
+      // Multi-wildcard pattern matching (e.g. SPIFFE SVIDs)
+      expect(
+        matchClaimPattern(
+          "spiffe://example.com/ns/production/sa/payment-service",
+          "spiffe://example.com/ns/*/sa/*",
+        ),
+      ).toBe(true);
+      expect(
+        matchClaimPattern(
+          "spiffe://example.com/ns/staging/sa/order-service",
+          "spiffe://example.com/ns/*/sa/*",
+        ),
+      ).toBe(true);
+      expect(
+        matchClaimPattern(
+          "spiffe://other.com/ns/staging/sa/order-service",
+          "spiffe://example.com/ns/*/sa/*",
+        ),
+      ).toBe(false);
+      expect(
+        matchClaimPattern(
+          "spiffe://example.com/ns/staging/job/batch-1",
+          "spiffe://example.com/ns/*/sa/*",
+        ),
+      ).toBe(false);
     });
 
     it("rejects expired JWTs and audience or issuer mismatches", async () => {
