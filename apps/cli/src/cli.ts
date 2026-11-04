@@ -125,7 +125,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   const dashDashIdx = argv.indexOf("--");
   const cliArgs = dashDashIdx !== -1 ? argv.slice(0, dashDashIdx) : argv;
 
-  if (cliArgs.length === 0 || cliArgs.includes("-h") || cliArgs.includes("--help") || cliArgs[0] === "help") {
+  if (
+    cliArgs.length === 0 ||
+    cliArgs.includes("-h") ||
+    cliArgs.includes("--help") ||
+    cliArgs[0] === "help"
+  ) {
     console.log(HELP_TEXT.trim());
     return 0;
   }

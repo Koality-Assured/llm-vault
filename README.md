@@ -56,7 +56,17 @@ All encryption and decryption executes locally in the browser (`window.crypto.su
    - Searchable tags are indexed using keyed `HMAC-SHA256` blind indexes derived from a vault-specific `VaultSearchKey` (`info = "llm-vault/v1/vault-search-key"`).
    - Audit records (`aud_<ulid>`) chain each event hash over `prev_event_hash || canonical_json(event)` via `HMAC-SHA256` and optional `Ed25519` signatures.
 
-## Monorepo Packages
+## Monorepo Architecture
+
+### Applications
+
+| Application      | Path       | Description                                                                                              |
+| ---------------- | ---------- | -------------------------------------------------------------------------------------------------------- |
+| `@llm-vault/cli` | `apps/cli` | Production CLI for vault administration, key stretching, secret ingestion, and child process injection.  |
+| `@llm-vault/api` | `apps/api` | Zero-knowledge Fastify REST API service backing standalone SQLite and enterprise PostgreSQL deployments. |
+| `@llm-vault/web` | `apps/web` | Responsive React/Tailwind operator console for credential management and audit verification.             |
+
+### Packages
 
 | Package             | Path              | Description                                                                                                                                                                                                                                  |
 | ------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

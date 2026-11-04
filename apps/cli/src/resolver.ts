@@ -79,7 +79,8 @@ export class SecretResolver {
    * Resolves all `{{vault:sec_<ulid>[#field]}}` or `{{vault:lease_<ulid>[#field]}}` placeholders in a text string.
    */
   async resolveString(template: string): Promise<string> {
-    const pattern = /\{\{vault:((?:sec|lease)_[0-9A-HJ-NP-Za-km-z]{26})(?:#([a-zA-Z0-9_-]+))?\}\}/gi;
+    const pattern =
+      /\{\{vault:((?:sec|lease)_[0-9A-HJ-NP-Za-km-z]{26})(?:#([a-zA-Z0-9_-]+))?\}\}/gi;
     const matches = Array.from(template.matchAll(pattern));
 
     if (matches.length === 0) {
